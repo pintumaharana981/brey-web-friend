@@ -5141,7 +5141,7 @@ CardModel chooseBotCard(
       if (opponent == botIndex) continue;
 
       final List<CardModel> targets = knownPenaltyTargetsForOpponent(opponent);
-      if (targets.isEmpty()) continue;
+      if (targets.isEmpty) continue;
 
       for (final CardModel target in targets) {
         if (leadCard.suit != target.suit || leadCard.value >= target.value) {
