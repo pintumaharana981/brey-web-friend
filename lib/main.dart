@@ -433,19 +433,11 @@ class _BreyGameState extends State<BreyGame> {
   // LEAD-SUIT TRACKING
   // ==========================================================
 
-  List<String?> lastLedSuitByPlayer = [
-    null,
-    null,
-    null,
-    null,
-  ];
-
-  List<int> consecutiveLeadCountByPlayer = [
-    0,
-    0,
-    0,
-    0,
-  ];
+  // Global lead tracking for the whole Round.
+  // The two-consecutive-same-suit limit applies to EVERY player,
+  // not separately to each player.
+  String? lastLedSuit;
+  int consecutiveLeadCount = 0;
 
   // ==========================================================
   // CREATE DECK
@@ -1280,19 +1272,8 @@ class _BreyGameState extends State<BreyGame> {
   // ==========================================================
 
   void resetLeadTracking() {
-    lastLedSuitByPlayer = [
-      null,
-      null,
-      null,
-      null,
-    ];
-
-    consecutiveLeadCountByPlayer = [
-      0,
-      0,
-      0,
-      0,
-    ];
+    lastLedSuit = null;
+    consecutiveLeadCount = 0;
   }
 
   // ==========================================================
@@ -1883,14 +1864,11 @@ class _BreyGameState extends State<BreyGame> {
     // ========================================================
 
     // Until ♠Q has been played:
-    // same player cannot lead the same suit
-    // for 3 consecutive Hands.
+    // no player can lead the same suit
+    // for more than 2 consecutive Hands.
     if (!spadeQueenPlayedThisRound) {
-      String? previousSuit =
-          lastLedSuitByPlayer[playerIndex];
-
-      int previousCount =
-          consecutiveLeadCountByPlayer[playerIndex];
+      String? previousSuit = lastLedSuit;
+      int previousCount = consecutiveLeadCount;
 
       if (
         previousSuit == card.suit &&
@@ -1953,17 +1931,14 @@ class _BreyGameState extends State<BreyGame> {
 
     if (!spadeQueenPlayedThisRound &&
         currentHand.isEmpty) {
-      String? previousSuit =
-          lastLedSuitByPlayer[playerIndex];
-
-      int previousCount =
-          consecutiveLeadCountByPlayer[playerIndex];
+      String? previousSuit = lastLedSuit;
+      int previousCount = consecutiveLeadCount;
 
       if (
         previousSuit == card.suit &&
         previousCount >= 2
       ) {
-        return 'You cannot lead the same suit 3 Hands in a row until ♠Q is played.';
+        return 'No player can lead the same suit for 3 Hands in a row until ♠Q is played.';
       }
     }
 
@@ -2062,17 +2037,17 @@ class _BreyGameState extends State<BreyGame> {
 
     if (!spadeQueenPlayedThisRound &&
         currentHand.isEmpty &&
-        lastLedSuitByPlayer[0] != null &&
-        lastLedSuitByPlayer[0] == card.suit &&
-        consecutiveLeadCountByPlayer[0] >= 2) {
+        lastLedSuit != null &&
+        lastLedSuit == card.suit &&
+        consecutiveLeadCount >= 2) {
       await _showRuleHintOnce(
         key: 'lead_limit',
         title: 'CHANGE THE LEAD SUIT',
         message:
-            'Until ♠Q is played, you cannot lead the same suit 3 Hands in a row. '
+            'Until ♠Q is played, nobody can lead the same suit 3 Hands in a row. '
             'Try another legal suit.',
         scenario: _hintScenario(
-          label: 'Same suit twice → change suit',
+          label: 'Same suit twice → everyone must change suit',
           cards: [
             _hintCard(rank: '6', suit: card.suit, highlighted: true),
           ],
@@ -2142,16 +2117,11 @@ class _BreyGameState extends State<BreyGame> {
     if (currentHand.isEmpty) {
       ledSuit = card.suit;
 
-      if (
-        lastLedSuitByPlayer[playerIndex] ==
-        card.suit
-      ) {
-        consecutiveLeadCountByPlayer[playerIndex]++;
+      if (lastLedSuit == card.suit) {
+        consecutiveLeadCount++;
       } else {
-        lastLedSuitByPlayer[playerIndex] =
-            card.suit;
-
-        consecutiveLeadCountByPlayer[playerIndex] = 1;
+        lastLedSuit = card.suit;
+        consecutiveLeadCount = 1;
       }
     }
 
@@ -4141,9 +4111,8 @@ CardModel chooseBotCard(
   }) {
     double score = 0;
     final Player bot = players[playerIndex];
-    final String? previousLead = lastLedSuitByPlayer[playerIndex];
-    final int previousLeadCount =
-        consecutiveLeadCountByPlayer[playerIndex];
+    final String? previousLead = lastLedSuit;
+    final int previousLeadCount = consecutiveLeadCount;
     final int currentWinner = determineCurrentWinner();
     final double visiblePenalty = currentHandPenaltyTotal();
 
