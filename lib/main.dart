@@ -1,4 +1,6 @@
+// BREY V1.2.11 — Penalty Targeting Intelligence
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -67,7 +69,6 @@ enum BotDifficulty {
 class Player {
   final String name;
   final bool isHuman;
-  final int avatarIndex;
 
   List<CardModel> cards = [];
 
@@ -78,7 +79,6 @@ class Player {
   Player({
     required this.name,
     required this.isHuman,
-    this.avatarIndex = 0,
   });
 }
 
@@ -100,75 +100,19 @@ class PlayedCard {
 // APP
 // ============================================================
 
-class BreyApp extends StatefulWidget {
+class BreyApp extends StatelessWidget {
   const BreyApp({super.key});
-
-  @override
-  State<BreyApp> createState() => _BreyAppState();
-}
-
-class _BreyAppState extends State<BreyApp> {
-  ThemeMode _themeMode = ThemeMode.system;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadAppearance();
-  }
-
-  Future<void> _loadAppearance() async {
-    try {
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-      final String value = prefs.getString('brey_settings_appearance') ?? 'system';
-      if (!mounted) return;
-      setState(() {
-        _themeMode = _themeModeFromString(value);
-      });
-    } catch (_) {}
-  }
-
-  ThemeMode _themeModeFromString(String value) {
-    switch (value) {
-      case 'light':
-        return ThemeMode.light;
-      case 'dark':
-        return ThemeMode.dark;
-      default:
-        return ThemeMode.system;
-    }
-  }
-
-  void _changeAppearance(String value) {
-    setState(() {
-      _themeMode = _themeModeFromString(value);
-    });
-  }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'BREY',
-      themeMode: _themeMode,
       theme: ThemeData(
-        brightness: Brightness.light,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xff8a651e),
-          brightness: Brightness.light,
-        ),
+        primarySwatch: Colors.indigo,
         scaffoldBackgroundColor: const Color(0xffeef0ed),
-        useMaterial3: true,
       ),
-      darkTheme: ThemeData(
-        brightness: Brightness.dark,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xffc29a45),
-          brightness: Brightness.dark,
-        ),
-        scaffoldBackgroundColor: const Color(0xff11110f),
-        useMaterial3: true,
-      ),
-      home: BreyGame(onAppearanceChanged: _changeAppearance),
+      home: const BreyGame(),
     );
   }
 }
@@ -178,12 +122,7 @@ class _BreyAppState extends State<BreyApp> {
 // ============================================================
 
 class BreyGame extends StatefulWidget {
-  final ValueChanged<String>? onAppearanceChanged;
-
-  const BreyGame({
-    super.key,
-    this.onAppearanceChanged,
-  });
+  const BreyGame({super.key});
 
   @override
   State<BreyGame> createState() => _BreyGameState();
@@ -193,9 +132,169 @@ class _BreyGameState extends State<BreyGame> {
   @override
   void initState() {
     super.initState();
-    _loadPlayerProfile();
-    _loadGameStatistics();
-    _loadSettings();
+    _loadAdaptiveLearning();
+  }
+
+  Future<void> _loadAdaptiveLearning() async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+
+      final String? raw = prefs.getString(_learningStorageKey);
+      if (raw != null && raw.isNotEmpty) {
+        final dynamic decoded = jsonDecode(raw);
+        if (decoded is Map) {
+          decoded.forEach((dynamic playerKey, dynamic values) {
+            final int? playerIndex = int.tryParse(playerKey.toString());
+            if (playerIndex == null || playerIndex < 1 || playerIndex > 3) return;
+            if (values is! Map) return;
+
+            final Map<String, double> memory = <String, double>{};
+            values.forEach((dynamic signature, dynamic value) {
+              final double? number = double.tryParse(value.toString());
+              if (number == null || !number.isFinite) return;
+              memory[signature.toString()] =
+                  number.clamp(-8.0, 8.0).toDouble();
+            });
+            learnedDecisionWeights[playerIndex] = memory;
+          });
+        }
+      }
+
+      // V42.50: restore the compact card-pattern memory so learned
+      // patterns survive app restarts instead of disappearing with the
+      // current BREY session.
+      final String? patternRaw = prefs.getString(_learningPatternStorageKey);
+      if (patternRaw != null && patternRaw.isNotEmpty) {
+        final dynamic patternDecoded = jsonDecode(patternRaw);
+        if (patternDecoded is Map) {
+          patternDecoded.forEach((dynamic signature, dynamic value) {
+            final double? number = double.tryParse(value.toString());
+            if (number == null || !number.isFinite) return;
+            _learningPatternMemory[signature.toString()] =
+                number.clamp(-8.0, 8.0).toDouble();
+          });
+        }
+      }
+
+      final String? styleRaw = prefs.getString(_playerStyleStorageKey);
+      if (styleRaw != null && styleRaw.isNotEmpty) {
+        final dynamic styleDecoded = jsonDecode(styleRaw);
+        if (styleDecoded is Map) {
+          styleDecoded.forEach((dynamic signature, dynamic value) {
+            final double? number = double.tryParse(value.toString());
+            if (number == null || !number.isFinite) return;
+            playerStyleWeights[signature.toString()] =
+                number.clamp(-8.0, 8.0).toDouble();
+          });
+        }
+      }
+
+      final String? opponentRaw =
+          prefs.getString(_opponentBehaviorStorageKey);
+      if (opponentRaw != null && opponentRaw.isNotEmpty) {
+        final dynamic opponentDecoded = jsonDecode(opponentRaw);
+        if (opponentDecoded is Map) {
+          opponentDecoded.forEach((dynamic playerKey, dynamic values) {
+            final int? playerIndex = int.tryParse(playerKey.toString());
+            if (playerIndex == null || playerIndex < 1 || playerIndex > 3) {
+              return;
+            }
+            if (values is! Map) return;
+            final Map<String, double> memory = <String, double>{};
+            values.forEach((dynamic signature, dynamic value) {
+              final double? number = double.tryParse(value.toString());
+              if (number == null || !number.isFinite) return;
+              memory[signature.toString()] =
+                  number.clamp(-8.0, 8.0).toDouble();
+            });
+            opponentBehaviorWeights[playerIndex] = memory;
+          });
+        }
+      }
+      final String? gameRaw = prefs.getString(_gameOutcomeStorageKey);
+      if (gameRaw != null && gameRaw.isNotEmpty) {
+        final dynamic gameDecoded = jsonDecode(gameRaw);
+        if (gameDecoded is Map) {
+          gameDecoded.forEach((dynamic key, dynamic value) {
+            final int? index = int.tryParse(key.toString());
+            final double? number = double.tryParse(value.toString());
+            if (index == null || index < 1 || index > 3) return;
+            if (number == null || !number.isFinite) return;
+            gameOutcomeWeights[index] = number.clamp(-8.0, 8.0).toDouble();
+          });
+        }
+      }
+
+      // V42.45: load how many completed Rounds have informed each BOT's
+      // game-level model. Confidence grows gradually instead of allowing a
+      // small number of games to dominate the BOT's established strategy.
+      final String? experienceRaw =
+          prefs.getString(_gameOutcomeExperienceStorageKey);
+      if (experienceRaw != null && experienceRaw.isNotEmpty) {
+        final dynamic experienceDecoded = jsonDecode(experienceRaw);
+        if (experienceDecoded is Map) {
+          experienceDecoded.forEach((dynamic key, dynamic value) {
+            final int? index = int.tryParse(key.toString());
+            final int? count = int.tryParse(value.toString());
+            if (index == null || index < 1 || index > 3) return;
+            if (count == null || count < 0) return;
+            gameOutcomeExperience[index] = count.clamp(0, 200);
+          });
+        }
+      }
+
+    } catch (_) {
+      // Persistence must never prevent BREY from starting.
+    } finally {
+      _learningLoaded = true;
+    }
+  }
+
+  Future<void> _saveAdaptiveLearning() async {
+    if (!_learningLoaded) return;
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      final Map<String, Map<String, double>> data = <String, Map<String, double>>{};
+      learnedDecisionWeights.forEach((int playerIndex, Map<String, double> memory) {
+        data[playerIndex.toString()] = Map<String, double>.from(memory);
+      });
+      await prefs.setString(_learningStorageKey, jsonEncode(data));
+      await prefs.setString(
+        _learningPatternStorageKey,
+        jsonEncode(_learningPatternMemory),
+      );
+      await prefs.setString(
+        _playerStyleStorageKey,
+        jsonEncode(playerStyleWeights),
+      );
+      final Map<String, Map<String, double>> opponentData =
+          <String, Map<String, double>>{};
+      opponentBehaviorWeights.forEach(
+        (int playerIndex, Map<String, double> memory) {
+          opponentData[playerIndex.toString()] =
+              Map<String, double>.from(memory);
+        },
+      );
+      await prefs.setString(
+        _opponentBehaviorStorageKey,
+        jsonEncode(opponentData),
+      );
+      final Map<String, double> gameData = <String, double>{};
+      gameOutcomeWeights.forEach((int index, double value) {
+        gameData[index.toString()] = value;
+      });
+      await prefs.setString(_gameOutcomeStorageKey, jsonEncode(gameData));
+      final Map<String, int> experienceData = <String, int>{};
+      gameOutcomeExperience.forEach((int index, int count) {
+        experienceData[index.toString()] = count;
+      });
+      await prefs.setString(
+        _gameOutcomeExperienceStorageKey,
+        jsonEncode(experienceData),
+      );
+    } catch (_) {
+      // Gameplay continues normally if persistence is unavailable.
+    }
   }
 
   final Random random = Random();
@@ -225,108 +324,11 @@ class _BreyGameState extends State<BreyGame> {
   bool _isBackGameMenuOpen = false;
   bool exchangePhase = false;
   bool roundFinished = false;
-  bool gameOver = false;
-
-  // ==========================================================
-  // PLAYER PROFILE — V1.10 STEP A
-  // First-session name and cartoon avatar selection. Persistence
-  // will be added as a separate step so this change stays focused.
-  // ==========================================================
-  bool profileCreated = false;
-  bool _profileLoaded = false;
-  String _playerName = '';
-  int _selectedAvatarIndex = 0;
-
-  static const String _profileCreatedStorageKey = 'brey_profile_created';
-  static const String _profileNameStorageKey = 'brey_profile_name';
-  static const String _profileAvatarStorageKey = 'brey_profile_avatar';
-  final TextEditingController _profileNameController =
-      TextEditingController();
-
-  // ==========================================================
-  // PLAYER GAME STATISTICS — V1.13
-  // Persistent statistics are updated only when a game actually ends.
-  // ==========================================================
-  int _gamesPlayed = 0;
-  int _gamesWon = 0;
-  int _gamesLost = 0;
-  int _totalHandsPlayed = 0;
-  int _totalHandsWon = 0;
-  int _bestScore = -1; // Lowest completed-game score is best.
-  int _totalPenaltyPointsReceived = 0;
-  int _highestScoreReached = 0;
-  bool _gameStatsLoaded = false;
-  bool _currentGameStatsRecorded = false;
-
-  // ==========================================================
-  // SETTINGS — V1.18
-  // Preferences are saved locally. V1.17 wires gameplay convenience preferences
-  // feedback into the existing game events without changing gameplay.
-  // ==========================================================
-  bool _vibrationEnabled = true;
-  String _appearanceMode = 'system';
-  bool _cardAnimationEnabled = true;
-  String _animationSpeed = 'normal';
-  bool _autoNextHand = true;
-  bool _beginnerHintsEnabled = true;
-  bool _ruleRemindersEnabled = true;
-  bool _keepScreenAwake = true;
-
-  static const String _settingsVibrationKey = 'brey_settings_vibration';
-  static const String _settingsAppearanceKey = 'brey_settings_appearance';
-  static const String _settingsCardAnimationKey = 'brey_settings_card_animation';
-  static const String _settingsAnimationSpeedKey = 'brey_settings_animation_speed';
-  static const String _settingsAutoNextHandKey = 'brey_settings_auto_next_hand';
-  static const String _settingsHintsKey = 'brey_settings_hints';
-  static const String _settingsRuleRemindersKey = 'brey_settings_rule_reminders';
-  static const String _settingsKeepAwakeKey = 'brey_settings_keep_awake';
-  bool _settingsLoaded = false;
-
-  static const String _gamesPlayedStorageKey = 'brey_stats_games_played';
-  static const String _gamesWonStorageKey = 'brey_stats_games_won';
-  static const String _gamesLostStorageKey = 'brey_stats_games_lost';
-  static const String _totalHandsPlayedStorageKey = 'brey_stats_hands_played';
-  static const String _totalHandsWonStorageKey = 'brey_stats_hands_won';
-  static const String _bestScoreStorageKey = 'brey_stats_best_score';
-  static const String _totalPenaltyStorageKey = 'brey_stats_penalty_received';
-  static const String _highestScoreStorageKey = 'brey_stats_highest_score';
-
-  static const List<Map<String, String>> _playerAvatars = [
-    {'gender': 'Male', 'emoji': '🧑🏻‍🎨', 'name': 'Artist'},
-    {'gender': 'Male', 'emoji': '🧑🏽‍🚀', 'name': 'Explorer'},
-    {'gender': 'Male', 'emoji': '🧑🏿‍🎓', 'name': 'Scholar'},
-    {'gender': 'Female', 'emoji': '👩🏻‍🎨', 'name': 'Artist'},
-    {'gender': 'Female', 'emoji': '👩🏽‍🚀', 'name': 'Explorer'},
-    {'gender': 'Female', 'emoji': '👩🏿‍🎓', 'name': 'Scholar'},
-  ];
-
-  // Cartoon avatars used for the three BOTs in the scoreboard.
-  // These are intentionally separate from the user's six profile avatars.
-  static const List<String> _botAvatars = [
-    '🤖',
-    '👾',
-    '🦾',
-  ];
-
-  String _botAvatarForPlayer(Player player) {
-    final int playerIndex = players.indexOf(player);
-    final int botNumber = playerIndex >= 1 ? playerIndex - 1 : 0;
-    return _botAvatars[botNumber.clamp(0, _botAvatars.length - 1).toInt()];
-  }
 
   // Hand-completion animation state. Cards remain visible while they
   // smoothly collect toward the winner before the next Hand begins.
   bool handCollecting = false;
   int? collectingWinnerIndex;
-
-  // Total penalty points collected by each player during the CURRENT Round.
-  // This is used for the Round-level 35-point rule.
-  final Map<int, int> roundPenaltyByPlayer = <int, int>{
-    0: 0,
-    1: 0,
-    2: 0,
-    3: 0,
-  };
 
   // Round dealing animation state. The actual 52-card deal is completed
   // immediately in memory, while the UI reveals the deal progressively.
@@ -357,6 +359,49 @@ class _BreyGameState extends State<BreyGame> {
   // could legitimately know from the exchange or cards publicly played.
   // It never reads an opponent's hidden hand to make a decision.
   final Map<String, int> knownCardOwner = {};
+
+  // ==========================================================
+  // ADAPTIVE LEARNING MEMORY
+  // ==========================================================
+
+  // Learns only from public game outcomes. These weights stay alive while
+  // the app is open, so the BOT can adapt across Hands and Games without
+  // reading hidden opponent cards or changing the game rules.
+  final Map<int, Map<String, double>> learnedDecisionWeights = {};
+  final Map<int, List<String>> lastBotDecisionSignatures =
+      <int, List<String>>{};
+
+  // V42.41: model the human player's public playing style.
+  final Map<String, double> playerStyleWeights = <String, double>{};
+  final List<String> _humanHandDecisionSignatures = <String>[];
+
+  // V42.42: each opponent gets a separate public-behavior model. The BOT
+  // learns only from cards that opponent actually played.
+  final Map<int, Map<String, double>> opponentBehaviorWeights =
+      <int, Map<String, double>>{};
+  final Map<int, List<String>> _opponentHandDecisionSignatures =
+      <int, List<String>>{};
+
+  // V42.47: bounded memory of card-choice outcomes. Keys use suit:value.
+  // The map is intentionally lightweight and starts empty.
+  final Map<String, double> _learningPatternMemory = <String, double>{};
+
+  // Persistent adaptive memory. Only bounded learning weights are stored.
+  static const String _learningStorageKey = 'brey_adaptive_learning_v42_40';
+  static const String _playerStyleStorageKey = 'brey_player_style_v42_41';
+  static const String _opponentBehaviorStorageKey =
+      'brey_opponent_behavior_v42_42';
+  // V42.50: persistent storage for the V42.47+ pattern-memory layer.
+  static const String _learningPatternStorageKey =
+      'brey_learning_pattern_memory_v42_50';
+  bool _learningLoaded = false;
+  final Map<int, double> gameOutcomeWeights = <int, double>{};
+  // V42.45: number of completed Rounds used to train each BOT's game-level
+  // outcome model. This is confidence metadata, not a gameplay rule.
+  final Map<int, int> gameOutcomeExperience = <int, int>{};
+  static const String _gameOutcomeStorageKey = 'brey_game_outcome_learning_v42_44';
+  static const String _gameOutcomeExperienceStorageKey =
+      'brey_game_outcome_experience_v42_45';
 
   // Publicly observed suit counts: cards of this suit already seen during
   // this Round. Used with void information to estimate what remains.
@@ -537,7 +582,7 @@ class _BreyGameState extends State<BreyGame> {
             fontSize: 11,
             fontWeight: FontWeight.w700,
             letterSpacing: 0.4,
-            color: Colors.black87,
+            color: Colors.black54,
           ),
         ),
         const SizedBox(height: 7),
@@ -553,7 +598,6 @@ class _BreyGameState extends State<BreyGame> {
                   style: const TextStyle(
                     fontSize: 20,
                     fontWeight: FontWeight.bold,
-                    color: Colors.black87,
                   ),
                 ),
               ),
@@ -575,21 +619,7 @@ class _BreyGameState extends State<BreyGame> {
       barrierDismissible: false,
       barrierLabel: title,
       barrierColor: Colors.black54,
-      transitionDuration: const Duration(milliseconds: 280),
-      transitionBuilder: (context, animation, secondaryAnimation, child) {
-        final curved = CurvedAnimation(
-          parent: animation,
-          curve: Curves.easeOutCubic,
-          reverseCurve: Curves.easeInCubic,
-        );
-        return FadeTransition(
-          opacity: curved,
-          child: ScaleTransition(
-            scale: Tween<double>(begin: 0.96, end: 1.0).animate(curved),
-            child: child,
-          ),
-        );
-      },
+      transitionDuration: const Duration(milliseconds: 220),
       pageBuilder: (dialogContext, animation, secondaryAnimation) {
         return SafeArea(
           child: Center(
@@ -620,20 +650,18 @@ class _BreyGameState extends State<BreyGame> {
                           Text(
                             title,
                             textAlign: TextAlign.center,
-                            style: TextStyle(
+                            style: const TextStyle(
                               fontSize: 19,
                               fontWeight: FontWeight.bold,
-                              color: Colors.black87,
                             ),
                           ),
                           const SizedBox(height: 9),
                           Text(
                             message,
                             textAlign: TextAlign.left,
-                            style: TextStyle(
+                            style: const TextStyle(
                               fontSize: 14,
                               height: 1.35,
-                              color: Colors.black87,
                             ),
                           ),
                           if (scenario != null) ...[
@@ -669,6 +697,22 @@ class _BreyGameState extends State<BreyGame> {
           ),
         );
       },
+      transitionBuilder: (context, animation, secondaryAnimation, child) {
+        final curved = CurvedAnimation(
+          parent: animation,
+          curve: Curves.easeOutCubic,
+        );
+        return FadeTransition(
+          opacity: curved,
+          child: ScaleTransition(
+            scale: Tween<double>(
+              begin: 0.94,
+              end: 1.0,
+            ).animate(curved),
+            child: child,
+          ),
+        );
+      },
     );
   }
 
@@ -678,7 +722,7 @@ class _BreyGameState extends State<BreyGame> {
     required String message,
     Widget? scenario,
   }) async {
-    if (!mounted || !_ruleRemindersEnabled || _shownRuleHints.contains(key)) return;
+    if (!mounted || _shownRuleHints.contains(key)) return;
 
     _shownRuleHints.add(key);
 
@@ -691,7 +735,6 @@ class _BreyGameState extends State<BreyGame> {
 
   Future<void> _showFirstHandHint() async {
     if (!mounted ||
-        !_beginnerHintsEnabled ||
         _firstHandHintShown ||
         roundNumber != 1 ||
         handNumber != 1) {
@@ -767,9 +810,8 @@ class _BreyGameState extends State<BreyGame> {
   void startNewGame() {
     players = [
       Player(
-        name: _playerName.isEmpty ? 'YOU' : _playerName,
+        name: 'YOU',
         isHuman: true,
-        avatarIndex: _selectedAvatarIndex,
       ),
       Player(
         name: 'BOT 1',
@@ -787,7 +829,6 @@ class _BreyGameState extends State<BreyGame> {
 
     roundNumber = 1;
     handNumber = 1;
-    _currentGameStatsRecorded = false;
 
     // Random dealer for Round 1.
     dealerIndex = random.nextInt(4);
@@ -797,15 +838,10 @@ class _BreyGameState extends State<BreyGame> {
     spadeQueenCollector = null;
     spadeQueenPlayedThisRound = false;
 
-    for (int i = 0; i < 4; i++) {
-      roundPenaltyByPlayer[i] = 0;
-    }
-
     currentHand.clear();
     ledSuit = null;
 
     roundFinished = false;
-    gameOver = false;
     exchangePhase = false;
     handCollecting = false;
     collectingWinnerIndex = null;
@@ -830,9 +866,9 @@ class _BreyGameState extends State<BreyGame> {
     resetVoidMemory();
 
     resetLeadTracking();
+    lastBotDecisionSignatures.clear();
 
     gameStarted = true;
-    
 
     dealRound();
 
@@ -895,27 +931,6 @@ class _BreyGameState extends State<BreyGame> {
       player.cards.clear();
     }
 
-    // A new Round starts a fresh 35-point penalty pool.
-    for (int i = 0; i < 4; i++) {
-      roundPenaltyByPlayer[i] = 0;
-    }
-
-    // A new Round must start with a completely fresh played-card
-    // collection. This is important because the previous Round already
-    // contains 52 cards in playedCardsThisRound. Clearing it here, before
-    // the stability check below, prevents Round 2+ from being seen as a
-    // 104-card state (52 old + 52 newly dealt) in debug mode.
-    playedCardsThisRound.clear();
-    knownCardOwner.clear();
-    playedSuitCounts.clear();
-    playedSuitCounts.addAll({
-      'Hearts': 0,
-      'Diamonds': 0,
-      'Clubs': 0,
-      'Spades': 0,
-    });
-    resetVoidMemory();
-
     // Dealer's RIGHT-side player starts.
     int startingPlayer = (dealerIndex + 1) % 4;
 
@@ -959,23 +974,24 @@ class _BreyGameState extends State<BreyGame> {
     selectedExchangeCards.clear();
 
     final int generation = ++_dealingGeneration;
-
-    // IMPORTANT: publish the dealing state before starting the animation.
-    // On later Rounds the dealer dialog is awaited, so relying on the
-    // caller's setState can leave the UI on the Round summary while the
-    // asynchronous dealing sequence is already running.
     message = 'Dealing cards...';
+    _runDealingAnimation(generation);
     exchangeSelections.clear();
 
     passedCardsByPlayer.clear();
     receivedCardsByPlayer.clear();
+    playedCardsThisRound.clear();
+    knownCardOwner.clear();
+    playedSuitCounts.addAll({
+      'Hearts': 0,
+      'Diamonds': 0,
+      'Clubs': 0,
+      'Spades': 0,
+    });
+    resetVoidMemory();
 
-    if (mounted) {
-      setState(() {});
-    }
-
-    // Start only after the dealing screen has been rendered.
-    await _runDealingAnimation(generation);
+    message =
+        'Select exactly 4 cards to pass to the player on your LEFT.';
   }
 
   // ==========================================================
@@ -996,10 +1012,6 @@ class _BreyGameState extends State<BreyGame> {
       setState(() {
         dealtCardCount = count;
       });
-
-      if (count == 1 || count % 4 == 0 || count == 52) {
-        
-      }
     }
 
     await Future.delayed(const Duration(milliseconds: 360));
@@ -1101,21 +1113,20 @@ class _BreyGameState extends State<BreyGame> {
         padding: const EdgeInsets.fromLTRB(16, 18, 16, 18),
         child: Column(
           children: [
-            Text(
+            const Text(
               'DEALING THE ROUND',
               style: TextStyle(
                 fontSize: 21,
                 fontWeight: FontWeight.w800,
                 letterSpacing: 1.1,
-                color: Theme.of(context).colorScheme.onSurface,
               ),
             ),
             const SizedBox(height: 4),
             Text(
               'Round $roundNumber • 52 cards',
-              style: TextStyle(
+              style: const TextStyle(
                 fontSize: 13,
-                color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.72),
+                color: Colors.black54,
               ),
             ),
             const SizedBox(height: 16),
@@ -1234,11 +1245,10 @@ class _BreyGameState extends State<BreyGame> {
             Text(
                 dealtCardCount >= 52
                     ? 'Deal complete'
-                    : '$dealtCardCount / 52 cards dealt',
-                style: TextStyle(
+                    : '$dealtCardCount / 52 cards dealt',                style: const TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w700,
-                  color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.82),
+                  color: Colors.black54,
                 ),
               ),
             const SizedBox(height: 8),
@@ -1296,7 +1306,6 @@ class _BreyGameState extends State<BreyGame> {
 
     if (selectedExchangeCards.contains(card)) {
       selectedExchangeCards.remove(card);
-      unawaited(_playFeedback());
     } else {
       if (selectedExchangeCards.length >= 4) {
         message = 'You can select only 4 cards.';
@@ -1305,32 +1314,6 @@ class _BreyGameState extends State<BreyGame> {
       }
 
       selectedExchangeCards.add(card);
-      unawaited(_playFeedback());
-
-      // Show the ♠Q exchange reminder immediately when ♠Q is selected
-      // by itself while another Spade is still in the player's hand.
-      if (card.isSpadeQueen &&
-          players[0].cards.where((c) => c.suit == 'Spades').length > 1 &&
-          selectedExchangeCards.where((c) => c.suit == 'Spades').length == 1 &&
-          _ruleRemindersEnabled) {
-        unawaited(
-          _showSmoothHint(
-            title: '♠Q EXCHANGE RULE',
-            message:
-                'You cannot pass ♠Q alone when you have another Spade. '
-                'Select at least one more Spade with ♠Q. '
-                'If ♠Q is your only Spade, no additional Spade is required.',
-            scenario: _hintScenario(
-              label: 'Pass ♠Q + another Spade',
-              cards: [
-                _hintCard(rank: 'Q', suit: 'Spades', highlighted: true),
-                _hintCard(rank: 'A', suit: 'Spades', highlighted: true),
-              ],
-              arrow: '✓',
-            ),
-          ),
-        );
-      }
     }
 
     setState(() {});
@@ -1761,11 +1744,7 @@ class _BreyGameState extends State<BreyGame> {
     // FINISH EXCHANGE
     // ========================================================
 
-    // Explicitly leave the dealing/exchange screens before rebuilding.
-    // This prevents later-round state from leaving the human hand hidden.
-    dealingPhase = false;
     exchangePhase = false;
-    dealtCardCount = 52;
 
     selectedExchangeCards.clear();
     exchangeSelections.clear();
@@ -1779,16 +1758,6 @@ class _BreyGameState extends State<BreyGame> {
 
     message =
         'Exchange complete. Hand 1 begins.';
-
-    // Ensure the human hand is visible after every exchange, including
-    // Round 4 and later.
-    if (mounted) {
-      setState(() {
-        dealingPhase = false;
-        exchangePhase = false;
-        dealtCardCount = 52;
-      });
-    }
 
     if (roundNumber == 1 && handNumber == 1) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -2130,13 +2099,12 @@ class _BreyGameState extends State<BreyGame> {
 
     if (!isLegalCard(0, card)) {
       message = getIllegalMessage(0, card);
-      unawaited(_playIllegalMoveFeedback());
       setState(() {});
-      if (_beginnerHintsEnabled) {
-        _showHintForIllegalPlay(card);
-      }
+      _showHintForIllegalPlay(card);
       return;
     }
+
+    observeHumanDecision(card, leading: currentHand.isEmpty);
     playCard(0, card);
 
     setState(() {});
@@ -2194,9 +2162,6 @@ class _BreyGameState extends State<BreyGame> {
       voidSuitsByPlayer[playerIndex].add(ledSuit!);
     }
 
-    // Every successful card play gets haptic feedback. This also covers BOT card plays.
-    unawaited(_playFeedback());
-
     // Remove card from player's hand.
     players[playerIndex].cards.remove(card);
 
@@ -2208,6 +2173,15 @@ class _BreyGameState extends State<BreyGame> {
       ),
     );
 
+    // V42.42: record BOT behavior only after the card is publicly played.
+    if (playerIndex >= 1 && playerIndex <= 3) {
+      observeOpponentDecision(
+        playerIndex,
+        card,
+        leading: currentHand.length == 1,
+      );
+    }
+
     playedCardsThisRound.add(card);
     playedSuitCounts[card.suit] = (playedSuitCounts[card.suit] ?? 0) + 1;
     knownCardOwner.remove(cardKey(card));
@@ -2217,7 +2191,6 @@ class _BreyGameState extends State<BreyGame> {
     // ========================================================
 
     if (card.isSpadeQueen) {
-      unawaited(_playFeedback(strongVibration: true));
       spadeQueenPlayedThisRound = true;
 
       // The player who collects the Hand containing ♠Q
@@ -2244,7 +2217,7 @@ class _BreyGameState extends State<BreyGame> {
     // ========================================================
 
     _runGameplayStabilityChecks();
-    unawaited(completeHand());
+    completeHand();
   }
 
   // ==========================================================
@@ -2311,157 +2284,6 @@ class _BreyGameState extends State<BreyGame> {
         knownCardOwner[cardKey(card)] = receiver;
       }
     }
-  }
-
-  // ==========================================================
-  // V1.2.1 PUBLIC CARD MEMORY / REMAINING-CARD INTELLIGENCE
-  // ==========================================================
-  // The BOT remembers every card that has been publicly played in the
-  // current Round and derives the cards that are still unseen. It never
-  // treats an opponent's hidden hand as public information.
-
-  List<CardModel> remainingUnseenCards() {
-    final List<CardModel> deck = createDeck();
-    final Set<String> seen = <String>{
-      ...playedCardsThisRound.map(cardKey),
-    };
-    return deck.where((card) => !seen.contains(cardKey(card))).toList();
-  }
-
-  List<CardModel> remainingUnseenSuitCards(String suit) {
-    return remainingUnseenCards()
-        .where((card) => card.suit == suit)
-        .toList();
-  }
-
-  bool isCardStillUnseen(CardModel card) {
-    return !playedCardsThisRound.any(
-      (played) => cardKey(played) == cardKey(card),
-    );
-  }
-
-  int remainingCardsOfSuitAbove(String suit, int value) {
-    return remainingUnseenSuitCards(suit)
-        .where((card) => card.value > value)
-        .length;
-  }
-
-  int remainingPenaltyInSuit(String suit) {
-    return remainingUnseenSuitCards(suit)
-        .fold<int>(0, (sum, card) => sum + card.penalty);
-  }
-
-  // Estimate which player can realistically win the current Hand using
-  // only cards already visible on the table plus each player's known voids.
-  // This is deliberately conservative: unknown cards remain unknown.
-  int likelyCurrentHandWinnerFor(int botIndex) {
-    if (currentHand.isEmpty || ledSuit == null) return -1;
-
-    final int currentWinner = determineCurrentWinner();
-    if (currentHand.length >= 4) return currentWinner;
-
-    final int winningValue = currentHand
-        .where((played) => played.card.suit == ledSuit)
-        .fold<int>(-1, (best, played) =>
-            played.card.value > best ? played.card.value : best);
-
-    // If every unplayed card above the current winner is already known to be
-    // unavailable (publicly played or held by this BOT), the current winner
-    // is effectively protected.
-    final int higherRemaining = remainingCardsOfSuitAbove(
-      ledSuit!,
-      winningValue,
-    );
-
-    final int higherInBot = players[botIndex]
-        .cards
-        .where((card) => card.suit == ledSuit && card.value > winningValue)
-        .length;
-
-    if (higherRemaining <= higherInBot) {
-      return currentWinner;
-    }
-
-    return currentWinner;
-  }
-
-  // Score a candidate according to the cards that are still alive.
-  // The key idea is: if a candidate can safely lose, allow another player
-  // to retain the Hand; if the current winner is protected by card-counting,
-  // do not waste a higher card trying to overtake them.
-  double scoreRemainingCardMemory(
-    int botIndex,
-    CardModel candidate, {
-    required bool winning,
-  }) {
-    double score = 0;
-    final int higherRemaining = remainingCardsOfSuitAbove(
-      candidate.suit,
-      candidate.value,
-    );
-
-    // A high card becomes safer after all cards above it disappear.
-    if (higherRemaining == 0) {
-      score += winning ? 20 : -20;
-    } else if (higherRemaining == 1) {
-      score += winning ? 8 : -6;
-    }
-
-    // Preserve low cards when many cards of the suit remain; they are useful
-    // exits for future Hands. Conversely, when the suit is nearly exhausted,
-    // spending a low card can manufacture control/void opportunities.
-    final int suitRemaining = remainingUnseenSuitCards(candidate.suit).length;
-    if (candidate.value <= 7 && candidate.penalty == 0) {
-      score += suitRemaining >= 6 ? 8 : 16;
-    }
-
-    // If the candidate is a penalty card and another player is currently
-    // winning, unloading it onto that winner can be valuable.
-    final int currentWinner = likelyCurrentHandWinnerFor(botIndex);
-    if (!winning && currentWinner >= 0 && currentWinner != botIndex) {
-      final int targetScore = players[currentWinner].score;
-      if (targetScore >= 94) {
-        score += candidate.penalty * 18;
-      } else if (targetScore >= 88) {
-        score += candidate.penalty * 10;
-      } else {
-        score += candidate.penalty * 3;
-      }
-    }
-
-    // When a Hand already contains penalty, deliberately keeping another
-    // player ahead can be preferable to taking the Hand ourselves.
-    final int visiblePenalty = currentHandPenaltyTotal().round();
-    if (!winning && currentWinner >= 0 && currentWinner != botIndex) {
-      score += visiblePenalty * 4;
-    }
-
-    return score;
-  }
-
-  // Public-memory decision: determine whether a bot should deliberately
-  // avoid overtaking the current winner. This is the central behaviour the
-  // previous random strategy was missing.
-  bool shouldLetCurrentWinnerKeepHand(int botIndex) {
-    if (currentHand.isEmpty) return false;
-    final int winner = determineCurrentWinner();
-    if (winner < 0 || winner == botIndex) return false;
-
-    final int penalty = currentHandPenaltyTotal().round();
-    final int targetScore = players[winner].score;
-
-    // A loaded Hand should normally stay with another player, particularly
-    // when that player is approaching the danger zone.
-    if (penalty >= 6) return true;
-    if (targetScore >= 94 && penalty >= 2) return true;
-    if (targetScore >= 88 && penalty >= 3) return true;
-
-    // If the visible card count says the current winner has no realistic
-    // higher-card threat, there is no reason to overtake them.
-    return remainingCardsOfSuitAbove(
-          ledSuit!,
-          currentHand.first.card.value,
-        ) <= 1;
   }
 
   int unseenCardsOfSuit(String suit) {
@@ -3212,6 +3034,285 @@ class _BreyGameState extends State<BreyGame> {
     }
 
     return score;
+  }
+
+  String learningSignature(
+    CardModel card, {
+    required bool winning,
+    required bool leading,
+  }) {
+    final String mode = leading
+        ? 'lead'
+        : (winning ? 'win' : 'lose');
+    final int valueBucket = card.value <= 5
+        ? 0
+        : card.value <= 9
+            ? 1
+            : card.value <= 12
+                ? 2
+                : 3;
+    final int penaltyBucket = card.penalty == 0
+        ? 0
+        : card.penalty <= 2
+            ? 1
+            : card.penalty <= 6
+                ? 2
+                : 3;
+    return '$mode|${card.suit}|v$valueBucket|p$penaltyBucket';
+  }
+
+  double scoreLearnedExperience(
+    int playerIndex,
+    CardModel candidate, {
+    required bool winning,
+    required bool leading,
+  }) {
+    if (!_learningLoaded) return 0.0;
+    final Map<String, double> memory =
+        learnedDecisionWeights[playerIndex] ?? const <String, double>{};
+    final String signature = learningSignature(
+      candidate,
+      winning: winning,
+      leading: leading,
+    );
+    return memory[signature] ?? 0.0;
+  }
+
+  void rememberBotDecision(
+    int playerIndex,
+    CardModel card, {
+    required bool winning,
+    required bool leading,
+  }) {
+    lastBotDecisionSignatures
+        .putIfAbsent(playerIndex, () => <String>[])
+        .add(
+          learningSignature(
+            card,
+            winning: winning,
+            leading: leading,
+          ),
+        );
+  }
+
+  void learnFromCompletedHand(int winnerIndex, int handPenalty) {
+    for (int playerIndex = 1; playerIndex < 4; playerIndex++) {
+      final List<String>? signatures = lastBotDecisionSignatures[playerIndex];
+      if (signatures == null || signatures.isEmpty) continue;
+
+      final Map<String, double> memory =
+          learnedDecisionWeights.putIfAbsent(
+        playerIndex,
+        () => <String, double>{},
+      );
+
+      final bool won = winnerIndex == playerIndex;
+      // Every public BOT decision in the Hand contributes to learning. The
+      // previous learner remembered only the final decision, which meant most
+      // of the Hand was discarded as training data.
+      double reward;
+      if (won) {
+        reward = handPenalty == 0
+            ? 1.8
+            : -(handPenalty.clamp(0, 35) / 7.0);
+      } else {
+        reward = handPenalty == 0 ? 0.4 : 0.9;
+      }
+
+      // Repeatedly playing the same decision pattern in one Hand should not
+      // multiply its learning signal without limit. Count each signature once
+      // per Hand, then apply the bounded update.
+      final Set<String> uniqueSignatures = signatures.toSet();
+      final double perDecisionReward = reward /
+          sqrt(uniqueSignatures.length.toDouble().clamp(1.0, 4.0));
+
+      for (final String signature in uniqueSignatures) {
+        final double oldValue = memory[signature] ?? 0.0;
+        // Small bounded updates prevent one unusual Hand from dominating the
+        // BOT's established strategy.
+        final double learningRate = adaptiveLearningRate(playerIndex);
+        final double updated =
+            (oldValue * (1.0 - learningRate)) +
+            (perDecisionReward * learningRate);
+        memory[signature] = updated.clamp(-8.0, 8.0).toDouble();
+
+        // V42.49: also maintain a compact pattern-memory layer. This uses the
+        // same decision signature, so it can be activated directly during
+        // future card selection without depending on an exact card value.
+        final double oldPattern = _learningPatternMemory[signature] ?? 0.0;
+        _learningPatternMemory[signature] =
+            ((oldPattern * 0.92) + (perDecisionReward * 0.08))
+                .clamp(-8.0, 8.0)
+                .toDouble();
+      }
+    }
+
+    lastBotDecisionSignatures.clear();
+    _saveAdaptiveLearning();
+  }
+
+    String playerStyleSignature(CardModel card, {required bool leading}) {
+    final int valueBucket = card.value <= 5 ? 0 : (card.value <= 9 ? 1 : 2);
+    final int penaltyBucket =
+        card.penalty == 0 ? 0 : (card.penalty <= 2 ? 1 : 2);
+    return '${leading ? 'lead' : 'follow'}|${card.suit}|v$valueBucket|p$penaltyBucket';
+  }
+
+  void observeHumanDecision(CardModel card, {required bool leading}) {
+    _humanHandDecisionSignatures.add(
+      playerStyleSignature(card, leading: leading),
+    );
+  }
+
+  double scorePlayerStylePrediction(
+    CardModel candidate, {
+    required bool leading,
+  }) {
+    if (!_learningLoaded) return 0.0;
+    final String signature =
+        playerStyleSignature(candidate, leading: leading);
+    return (playerStyleWeights[signature] ?? 0.0).clamp(-8.0, 8.0).toDouble();
+  }
+
+  void learnHumanPlayingStyle(int winnerIndex, int handPenalty) {
+    if (_humanHandDecisionSignatures.isEmpty) return;
+
+    final bool humanWon = winnerIndex == 0;
+    final double outcome = humanWon
+        ? (handPenalty == 0 ? 1.4 : -1.0)
+        : (handPenalty >= 8 ? -1.4 : 0.7);
+
+    for (final String signature in _humanHandDecisionSignatures) {
+      final double oldValue = playerStyleWeights[signature] ?? 0.0;
+      final double learningRate = adaptiveLearningRate(1);
+      final double updated =
+          (oldValue * (1.0 - learningRate)) + (outcome * learningRate);
+      playerStyleWeights[signature] = updated.clamp(-8.0, 8.0).toDouble();
+    }
+
+    _humanHandDecisionSignatures.clear();
+    _saveAdaptiveLearning();
+  }
+
+  String opponentBehaviorSignature(
+    CardModel card, {
+    required bool leading,
+  }) {
+    final int valueBucket = card.value <= 5
+        ? 0
+        : card.value <= 9
+            ? 1
+            : card.value <= 12
+                ? 2
+                : 3;
+    final int penaltyBucket = card.penalty == 0
+        ? 0
+        : card.penalty <= 2
+            ? 1
+            : card.penalty <= 6
+                ? 2
+                : 3;
+    return '${leading ? 'lead' : 'follow'}|${card.suit}|v$valueBucket|p$penaltyBucket';
+  }
+
+  void observeOpponentDecision(
+    int opponentIndex,
+    CardModel card, {
+    required bool leading,
+  }) {
+    _opponentHandDecisionSignatures
+        .putIfAbsent(opponentIndex, () => <String>[])
+        .add(opponentBehaviorSignature(card, leading: leading));
+  }
+
+  double scoreOpponentBehaviorPrediction(
+    int botIndex,
+    CardModel candidate, {
+    required bool leading,
+  }) {
+    if (!_learningLoaded) return 0.0;
+
+    double score = 0.0;
+    for (int opponent = 1; opponent < 4; opponent++) {
+      if (opponent == botIndex) continue;
+      final Map<String, double> memory =
+          opponentBehaviorWeights[opponent] ?? const <String, double>{};
+      final String signature =
+          opponentBehaviorSignature(candidate, leading: leading);
+      final double learned = memory[signature] ?? 0.0;
+
+      // A positive learned value means this opponent has historically made
+      // this type of public decision in favorable outcomes for themselves.
+      // When leading, slightly favor suits where a strong opponent pattern
+      // suggests they are comfortable; this makes the model predictive rather
+      // than simply rewarding imitation.
+      if (leading && candidate.suit == 'Spades') {
+        score -= learned * 0.35;
+      } else {
+        score += learned * 0.18;
+      }
+    }
+    return score.clamp(-6.0, 6.0).toDouble();
+  }
+
+  void learnOpponentBehavior(int winnerIndex, int handPenalty) {
+    if (_opponentHandDecisionSignatures.isEmpty) return;
+
+    _opponentHandDecisionSignatures.forEach(
+      (int opponentIndex, List<String> signatures) {
+        if (signatures.isEmpty) return;
+        final Map<String, double> memory = opponentBehaviorWeights
+            .putIfAbsent(opponentIndex, () => <String, double>{});
+        final bool opponentWon = winnerIndex == opponentIndex;
+        final double outcome = opponentWon
+            ? (handPenalty == 0 ? 1.2 : -0.8)
+            : (handPenalty >= 8 ? -0.7 : 0.5);
+
+        for (final String signature in signatures) {
+          final double oldValue = memory[signature] ?? 0.0;
+          final double learningRate = adaptiveLearningRate(opponentIndex);
+          final double updated =
+              (oldValue * (1.0 - learningRate)) +
+              (outcome * learningRate);
+          memory[signature] = updated.clamp(-8.0, 8.0).toDouble();
+        }
+      },
+    );
+
+    _opponentHandDecisionSignatures.clear();
+    _saveAdaptiveLearning();
+  }
+
+  double adaptiveLearningRate(int playerIndex) {
+    final int experience = gameOutcomeExperience[playerIndex] ?? 0;
+    // Start conservatively, then learn faster once the BOT has accumulated
+    // enough completed-Round evidence. Cap the rate so new outcomes never
+    // overwrite established strategy too aggressively.
+    return (0.035 + (experience.clamp(0, 20) / 20.0) * 0.045)
+        .clamp(0.035, 0.08)
+        .toDouble();
+  }
+
+  double scoreLearningPatternMemory(int botIndex, CardModel card, {
+    required bool winning,
+    required bool leading,
+  }) {
+    if (!_learningLoaded) return 0.0;
+
+    final int experience = gameOutcomeExperience[botIndex] ?? 0;
+    final double confidence = (experience / 10.0).clamp(0.0, 1.0);
+    if (confidence == 0.0) return 0.0;
+
+    final String key = learningSignature(
+      card,
+      winning: winning,
+      leading: leading,
+    );
+    // Keep this influence deliberately small: learned patterns refine the
+    // strategic engine rather than replacing its rule-based reasoning.
+    return ((_learningPatternMemory[key] ?? 0.0) * confidence * 1.25)
+        .clamp(-6.0, 6.0)
+        .toDouble();
   }
 
 CardModel chooseBotCard(
@@ -4161,386 +4262,6 @@ CardModel chooseBotCard(
   }
 
   // ==========================================================
-  // V1.2 BOT STRATEGIC SITUATION ENGINE
-  // ==========================================================
-  // A compact final layer that makes the bots react to the actual state of
-  // the Round: penalty concentration, 88-99 protection, suit exhaustion,
-  // dangerous high cards and the current Hand winner.
-  double scoreStrategicSituation(
-    int playerIndex,
-    CardModel candidate, {
-    required bool leading,
-    required bool winning,
-  }) {
-    final Player bot = players[playerIndex];
-    double score = 0;
-    final int currentWinner = determineCurrentWinner();
-    final double visiblePenalty = currentHandPenaltyTotal();
-
-    // --------------------------------------------------------
-    // 1. Protect players in the 88-99 window from ♠Q.
-    // --------------------------------------------------------
-    if (currentWinner >= 0 && currentWinner != playerIndex) {
-      final int target = players[currentWinner].score;
-      if (target >= 88 && target <= 99) {
-        if (candidate.isSpadeQueen) {
-          score += winning ? -180 : 150;
-        }
-        if (candidate.penalty > 0) {
-          score += winning ? -candidate.penalty * 8 : candidate.penalty * 9;
-        }
-      }
-    }
-
-    // --------------------------------------------------------
-    // 2. Break a developing 35-point shoot.
-    // --------------------------------------------------------
-    int largestRoundPenalty = 0;
-    int largestCollector = -1;
-    for (final MapEntry<int, int> entry in roundPenaltyByPlayer.entries) {
-      if (entry.value > largestRoundPenalty) {
-        largestRoundPenalty = entry.value;
-        largestCollector = entry.key;
-      }
-    }
-
-    if (largestCollector >= 0 && largestCollector != playerIndex) {
-      final int remainingPenalty = max(0, 35 - largestRoundPenalty);
-      final bool shootThreat = largestRoundPenalty >= 10 ||
-          (largestRoundPenalty >= 7 && handNumber >= 7);
-
-      if (shootThreat) {
-        // Do not voluntarily feed the suspected collector a penalty.
-        if (candidate.penalty > 0) {
-          score -= candidate.penalty * 18;
-        }
-
-        // Prefer a move that makes another player capable of winning the
-        // current loaded Hand instead of extending the collector's run.
-        if (currentWinner == largestCollector && visiblePenalty >= 3) {
-          score += winning ? 42 : -18;
-        }
-
-        // As the shoot gets closer, protecting the remaining penalty pool
-        // becomes more important.
-        if (remainingPenalty <= 12 && candidate.penalty > 0) {
-          score -= candidate.penalty * 12;
-        }
-      }
-    }
-
-    // --------------------------------------------------------
-    // 3. Create and exploit voids.
-    // --------------------------------------------------------
-    if (leading) {
-      final List<CardModel> suitCards = bot.cards
-          .where((c) => c.suit == candidate.suit)
-          .toList();
-      if (suitCards.length == 1) score += 26;
-      if (suitCards.length == 2) score += 10;
-
-      // A suit with many already-played cards is close to exhaustion.
-      final int playedOfSuit = playedCardsThisRound
-          .where((c) => c.suit == candidate.suit)
-          .length;
-      if (playedOfSuit >= 7) score += 12;
-    }
-
-    // --------------------------------------------------------
-    // 4. Preserve low exits, but not when a dangerous penalty can be shed.
-    // --------------------------------------------------------
-    final int suitCount = bot.cards
-        .where((c) => c.suit == candidate.suit)
-        .length;
-    if (!leading && candidate.penalty == 0 && candidate.value <= 7 &&
-        suitCount >= 3) {
-      score -= 14;
-    }
-    if (candidate.penalty > 0 && suitCount <= 2) {
-      score += candidate.penalty * 7;
-    }
-
-    // --------------------------------------------------------
-    // 5. Endgame: unload dangerous cards and avoid unnecessary control.
-    // --------------------------------------------------------
-    if (isLateRound()) {
-      if (!winning && candidate.penalty > 0) {
-        score += candidate.penalty * 16;
-      }
-      if (winning && visiblePenalty >= 3) {
-        score -= visiblePenalty * 5;
-      }
-      if (candidate.value >= 12 && candidate.penalty == 0) {
-        score -= 8;
-      }
-    }
-
-    // --------------------------------------------------------
-    // 6. High-card danger based on cards already played.
-    // --------------------------------------------------------
-    final int higherPlayed = playedCardsThisRound.where((c) =>
-        c.suit == candidate.suit && c.value > candidate.value).length;
-    if (candidate.value >= 11 && higherPlayed >= 2) {
-      score += 8;
-    } else if (candidate.value >= 11 && higherPlayed == 0) {
-      score -= 8;
-    }
-
-    // Never allow this small layer to overpower the specialised engines.
-    return score.clamp(-90.0, 90.0).toDouble();
-  }
-
-  // ==========================================================
-  // V1.2.2 PROBABILITY-BASED OPPONENT CARD PREDICTION
-  // ==========================================================
-  // Uses public card memory to estimate hidden-card risk. Unknown cards
-  // remain probabilistic; no hidden hand is treated as certain.
-
-  List<CardModel> _unknownCardsForProbability(int botIndex) {
-    final Set<String> excluded = <String>{
-      ...playedCardsThisRound.map(cardKey),
-      ...players[botIndex].cards.map(cardKey),
-    };
-    return createDeck()
-        .where((card) => !excluded.contains(cardKey(card)))
-        .toList();
-  }
-
-  double probabilityOpponentHasSuit(
-    int botIndex,
-    int opponentIndex,
-    String suit,
-  ) {
-    final List<CardModel> unknown = _unknownCardsForProbability(botIndex);
-    final int suitCount = unknown.where((c) => c.suit == suit).length;
-    final int handSize = players[opponentIndex].cards.length;
-    if (unknown.isEmpty || suitCount <= 0 || handSize <= 0) return 0.0;
-
-    double noSuit = 1.0;
-    final int draws = min(handSize, unknown.length);
-    for (int i = 0; i < draws; i++) {
-      final int denominator = unknown.length - i;
-      final int nonSuit = max(0, unknown.length - suitCount - i);
-      if (denominator <= 0) break;
-      noSuit *= nonSuit / denominator;
-    }
-    return (1.0 - noSuit).clamp(0.0, 1.0).toDouble();
-  }
-
-  double probabilityOpponentHasCard(
-    int botIndex,
-    int opponentIndex,
-    CardModel target,
-  ) {
-    if (playedCardsThisRound.any((c) => cardKey(c) == cardKey(target))) {
-      return 0.0;
-    }
-    if (players[botIndex].cards.any((c) => cardKey(c) == cardKey(target))) {
-      return 0.0;
-    }
-    final List<CardModel> unknown = _unknownCardsForProbability(botIndex);
-    if (!unknown.any((c) => cardKey(c) == cardKey(target))) return 0.0;
-    final int handSize = players[opponentIndex].cards.length;
-    if (unknown.isEmpty || handSize <= 0) return 0.0;
-    return (handSize / unknown.length).clamp(0.0, 1.0).toDouble();
-  }
-
-  double probabilityOpponentHasHigher(
-    int botIndex,
-    int opponentIndex,
-    String suit,
-    int value,
-  ) {
-    final List<CardModel> unknown = _unknownCardsForProbability(botIndex);
-    final List<CardModel> higher = unknown
-        .where((c) => c.suit == suit && c.value > value)
-        .toList();
-    if (higher.isEmpty) return 0.0;
-
-    final int handSize = players[opponentIndex].cards.length;
-    double noHigher = 1.0;
-    for (int i = 0; i < min(handSize, unknown.length); i++) {
-      final int denominator = unknown.length - i;
-      final int nonHigher = max(0, unknown.length - higher.length - i);
-      if (denominator <= 0) break;
-      noHigher *= nonHigher / denominator;
-    }
-    return (1.0 - noHigher).clamp(0.0, 1.0).toDouble();
-  }
-
-  double probabilityAnyOpponentHasHigher(
-    int botIndex,
-    String suit,
-    int value,
-  ) {
-    double none = 1.0;
-    for (int opponent = 0; opponent < 4; opponent++) {
-      if (opponent == botIndex) continue;
-      final double p = probabilityOpponentHasHigher(
-        botIndex, opponent, suit, value,
-      );
-      none *= (1.0 - p).clamp(0.0, 1.0);
-    }
-    return (1.0 - none).clamp(0.0, 1.0).toDouble();
-  }
-
-  double scoreOpponentProbability(
-    int botIndex,
-    CardModel candidate, {
-    required bool winning,
-    bool leading = false,
-  }) {
-    double score = 0.0;
-    final double higherThreat = probabilityAnyOpponentHasHigher(
-      botIndex, candidate.suit, candidate.value,
-    );
-
-    if (winning) {
-      // Do not waste a control card when an unseen higher card is still likely.
-      score -= higherThreat * 34.0;
-    } else if (leading && candidate.value <= 8) {
-      // A low lead becomes more attractive when it is unlikely to be covered.
-      score += (1.0 - higherThreat) * 14.0;
-    }
-
-    // Estimate whether a dangerous opponent can follow this suit.
-    for (int opponent = 0; opponent < 4; opponent++) {
-      if (opponent == botIndex) continue;
-      final double pSuit = probabilityOpponentHasSuit(
-        botIndex, opponent, candidate.suit,
-      );
-      if (players[opponent].score >= 94) {
-        score += pSuit * (candidate.penalty + currentHandPenaltyTotal()) * 3.0;
-      } else if (players[opponent].score >= 88) {
-        score += pSuit * (candidate.penalty + currentHandPenaltyTotal()) * 1.5;
-      }
-    }
-
-    // Remaining dangerous cards make the bot more cautious about consuming
-    // high cards early in the Round.
-    final int remainingHigher = remainingCardsOfSuitAbove(
-      candidate.suit, candidate.value,
-    );
-    if (remainingHigher == 0) score += winning ? 18.0 : 5.0;
-
-    return score;
-  }
-
-  // ==========================================================
-  // V1.2.3 EXACT CARD-COUNTING / OWNER-CONSTRAINT ENGINE
-  // ==========================================================
-  // This layer converts the memory gathered so far into hard constraints.
-  // A card is either publicly gone, in the BOT's own hand, known to an
-  // exchanged owner, or still genuinely uncertain. Void suits further reduce
-  // the possible owners of every unseen card in that suit.
-
-  List<int> possibleOwnersForCard(int botIndex, CardModel card) {
-    final List<int> owners = <int>[];
-    if (playedCardsThisRound.any((c) => cardKey(c) == cardKey(card))) {
-      return owners;
-    }
-    for (int player = 0; player < 4; player++) {
-      if (player == botIndex) {
-        if (players[player].cards.any((c) => cardKey(c) == cardKey(card))) {
-          owners.add(player);
-        }
-        continue;
-      }
-      final int? knownOwner = knownCardOwner[cardKey(card)];
-      if (knownOwner != null && knownOwner != player) continue;
-      if (voidSuitsByPlayer[player].contains(card.suit)) continue;
-      owners.add(player);
-    }
-    return owners;
-  }
-
-  double cardOwnershipConfidence(
-    int botIndex,
-    CardModel card,
-    int targetPlayer,
-  ) {
-    final List<int> owners = possibleOwnersForCard(botIndex, card);
-    if (owners.isEmpty || !owners.contains(targetPlayer)) return 0.0;
-
-    final int? knownOwner = knownCardOwner[cardKey(card)];
-    if (knownOwner == targetPlayer) return 1.0;
-
-    // If only one legal owner remains, the card is effectively counted.
-    if (owners.length == 1) return 1.0;
-    return 1.0 / owners.length;
-  }
-
-  double scoreExactCardCounting(
-    int botIndex,
-    CardModel candidate, {
-    required bool winning,
-    bool leading = false,
-  }) {
-    double score = 0.0;
-
-    final List<CardModel> higher = remainingUnseenSuitCards(candidate.suit)
-        .where((c) => c.value > candidate.value)
-        .toList();
-
-    int forcedHigherOwners = 0;
-    for (final CardModel card in higher) {
-      final List<int> owners = possibleOwnersForCard(botIndex, card);
-      if (owners.length == 1 && owners.first != botIndex) {
-        forcedHigherOwners++;
-      }
-      if (owners.contains(botIndex)) {
-        continue;
-      }
-    }
-
-    if (winning) {
-      // A candidate is less attractive as a winner when a higher card has a
-      // uniquely determined opponent owner.
-      score -= forcedHigherOwners * 12.0;
-      if (higher.isEmpty) score += 24.0;
-    } else {
-      // If all remaining higher cards are already accounted for, the BOT can
-      // confidently judge whether its card will lose or win.
-      if (higher.isEmpty) score -= 18.0;
-      if (forcedHigherOwners == higher.length && higher.isNotEmpty) {
-        score += leading ? 10.0 : 22.0;
-      }
-    }
-
-    // Penalty-card ownership is especially valuable information. If a known
-    // high-score opponent owns a remaining penalty card in this suit, leading
-    // that suit can create a deliberate transfer opportunity.
-    for (int opponent = 0; opponent < 4; opponent++) {
-      if (opponent == botIndex) continue;
-      final int targetScore = players[opponent].score;
-      if (targetScore < 88) continue;
-
-      for (final CardModel card in remainingUnseenSuitCards(candidate.suit)) {
-        if (card.penalty <= 0) continue;
-        final double confidence = cardOwnershipConfidence(
-          botIndex, card, opponent,
-        );
-        score += confidence * card.penalty * (targetScore >= 94 ? 10.0 : 5.0);
-      }
-    }
-
-    // A void is stronger than a probability estimate: that player cannot
-    // follow this suit. This makes suit leads more purposeful.
-    if (leading) {
-      int knownVoids = 0;
-      for (int opponent = 0; opponent < 4; opponent++) {
-        if (opponent != botIndex &&
-            voidSuitsByPlayer[opponent].contains(candidate.suit)) {
-          knownVoids++;
-        }
-      }
-      score += knownVoids * 9.0;
-    }
-
-    return score.clamp(-100.0, 100.0).toDouble();
-  }
-
-  // ==========================================================
   // BOT LEAD — PLAN AHEAD, NOT JUST LOWEST CARD
   // ==========================================================
 
@@ -4578,12 +4299,10 @@ CardModel chooseBotCard(
       );
       score += scoreTablePosition(playerIndex, candidate, winning: false);
       score += scoreAdvancedCardCounting(playerIndex, candidate, leading: true);
-      score += scoreStrategicSituation(
-        playerIndex,
-        candidate,
-        leading: true,
-        winning: false,
-      );
+
+      // V1.2.11: actively search known opponent penalty targets. This layer
+      // is strongest for major penalties and becomes more important at 94+.
+      score += scorePenaltyTargetingLead(playerIndex, candidate);
 
       final List<CardModel> ownSuit = bot.cards
           .where((c) => c.suit == candidate.suit)
@@ -4669,17 +4388,28 @@ CardModel chooseBotCard(
         winning: false,
         leading: true,
       );
-      score += scoreRemainingCardMemory(
+      score += scorePlayerStylePrediction(
+        candidate,
+        leading: true,
+      ) * 1.5;
+      score += scoreOpponentBehaviorPrediction(
+        playerIndex,
+        candidate,
+        leading: true,
+      );
+      score += scoreLearningPatternMemory(
         playerIndex,
         candidate,
         winning: false,
+        leading: true,
       );
-      score += scoreOpponentProbability(
+      score += scoreLearnedExperience(
         playerIndex,
         candidate,
         winning: false,
-      );
-      score += scoreExactCardCounting(
+        leading: true,
+      ) * 6.0;
+      score += scoreGameLevelLearning(
         playerIndex,
         candidate,
         winning: false,
@@ -4708,6 +4438,12 @@ CardModel chooseBotCard(
     }
 
     final CardModel chosen = maybeUseDifficultyCard(best, legalCards);
+    rememberBotDecision(
+      playerIndex,
+      chosen,
+      winning: false,
+      leading: true,
+    );
     return chosen;
   }
 
@@ -4798,20 +4534,6 @@ CardModel chooseBotCard(
     );
 
     final int currentWinner = determineCurrentWinner();
-
-    // ♠Q SAFE PENALTY TRANSFER:
-    // If K♠ or A♠ is already on the table and this bot holds ♠Q,
-    // ♠Q cannot win. Play it now so the Hand winner receives 12 points.
-    if (ledSuit == 'Spades' && currentWinningValue >= 13) {
-      final CardModel queen = sameSuit.firstWhere(
-        (card) => card.isSpadeQueen,
-        orElse: () => sameSuit.first,
-      );
-      if (queen.isSpadeQueen && queen.value < currentWinningValue) {
-        return queen;
-      }
-    }
-
     final List<CardModel> losing = sameSuit
         .where((c) => c.value < currentWinningValue)
         .toList();
@@ -4829,12 +4551,6 @@ CardModel chooseBotCard(
           candidate,
           winning: false,
         );
-        score += scoreStrategicSituation(
-          playerIndex,
-          candidate,
-          leading: false,
-          winning: false,
-        );
         score += scorePenaltyTiming(
           playerIndex,
           candidate,
@@ -4850,11 +4566,6 @@ CardModel chooseBotCard(
           winning: false,
         );
         score += scoreFullHandSimulation(playerIndex, candidate, winning: false);
-        score += scoreRemainingCardMemory(
-          playerIndex,
-          candidate,
-          winning: false,
-        );
         score += evaluateQueenRisk(playerIndex, candidate);
         score += scorePredictedOpponentBehavior(
           playerIndex,
@@ -4914,21 +4625,38 @@ CardModel chooseBotCard(
         candidate,
         winning: false,
       );
-      score += scoreRemainingCardMemory(
+      score += scorePlayerStylePrediction(
+        candidate,
+        leading: false,
+      ) * 1.5;
+      score += scoreOpponentBehaviorPrediction(
         playerIndex,
         candidate,
-        winning: false,
+        leading: false,
       );
-      score += scoreOpponentProbability(
+      score += scoreLearningPatternMemory(
         playerIndex,
         candidate,
         winning: false,
+        leading: false,
       );
-      score += scoreExactCardCounting(
+      score += scoreLearningPatternMemory(
         playerIndex,
         candidate,
         winning: false,
-        leading: true,
+        leading: false,
+      );
+      score += scoreLearnedExperience(
+        playerIndex,
+        candidate,
+        winning: false,
+        leading: false,
+      ) * 6.0;
+      score += scoreGameLevelLearning(
+        playerIndex,
+        candidate,
+        winning: false,
+        leading: false,
       );
       score = balanceGrandmasterScore(score, candidate);
 
@@ -4953,6 +4681,12 @@ CardModel chooseBotCard(
       }
 
       final CardModel chosen = maybeUseDifficultyCard(best, losing);
+      rememberBotDecision(
+        playerIndex,
+        chosen,
+        winning: false,
+        leading: false,
+      );
       return chosen;
     }
 
@@ -4996,24 +4730,6 @@ CardModel chooseBotCard(
         winning: true,
       );
       score += scoreFullHandSimulation(playerIndex, candidate, winning: true);
-      score += scoreRemainingCardMemory(
-        playerIndex,
-        candidate,
-        winning: true,
-      );
-      score += scoreOpponentProbability(
-        playerIndex,
-        candidate,
-        winning: true,
-      );
-      score += scoreExactCardCounting(
-        playerIndex,
-        candidate,
-        winning: true,
-      );
-      if (shouldLetCurrentWinnerKeepHand(playerIndex)) {
-        score -= 55;
-      }
       score += scorePredictedOpponentBehavior(
         playerIndex,
         candidate,
@@ -5050,12 +4766,6 @@ CardModel chooseBotCard(
         score += candidate.penalty * 14;
       }
 
-      score += scoreStrategicSituation(
-        playerIndex,
-        candidate,
-        leading: false,
-        winning: true,
-      );
       score += scoreBehavioralIntelligence(
         playerIndex,
         candidate,
@@ -5065,6 +4775,33 @@ CardModel chooseBotCard(
         playerIndex,
         candidate,
         winning: true,
+      );
+      score += scorePlayerStylePrediction(
+        candidate,
+        leading: false,
+      ) * 1.5;
+      score += scoreOpponentBehaviorPrediction(
+        playerIndex,
+        candidate,
+        leading: false,
+      );
+      score += scoreLearningPatternMemory(
+        playerIndex,
+        candidate,
+        winning: true,
+        leading: false,
+      );
+      score += scoreLearnedExperience(
+        playerIndex,
+        candidate,
+        winning: true,
+        leading: false,
+      ) * 6.0;
+      score += scoreGameLevelLearning(
+        playerIndex,
+        candidate,
+        winning: true,
+        leading: false,
       );
       score = balanceGrandmasterScore(score, candidate);
 
@@ -5089,6 +4826,12 @@ CardModel chooseBotCard(
     }
 
     final CardModel chosen = maybeUseDifficultyCard(best, sameSuit);
+    rememberBotDecision(
+      playerIndex,
+      chosen,
+      winning: true,
+      leading: false,
+    );
     return chosen;
   }
 
@@ -5181,12 +4924,6 @@ CardModel chooseBotCard(
 
       if (candidate.isSpadeQueen) score -= 1000;
 
-      score += scoreStrategicSituation(
-        playerIndex,
-        candidate,
-        leading: false,
-        winning: false,
-      );
       score += scoreBehavioralIntelligence(
         playerIndex,
         candidate,
@@ -5196,6 +4933,27 @@ CardModel chooseBotCard(
         playerIndex,
         candidate,
         winning: false,
+      );
+      score += scorePlayerStylePrediction(
+        candidate,
+        leading: false,
+      ) * 1.5;
+      score += scoreOpponentBehaviorPrediction(
+        playerIndex,
+        candidate,
+        leading: false,
+      );
+      score += scoreLearnedExperience(
+        playerIndex,
+        candidate,
+        winning: false,
+        leading: false,
+      ) * 6.0;
+      score += scoreGameLevelLearning(
+        playerIndex,
+        candidate,
+        winning: false,
+        leading: false,
       );
       score = balanceGrandmasterScore(score, candidate);
 
@@ -5220,6 +4978,12 @@ CardModel chooseBotCard(
     }
 
     final CardModel chosen = maybeUseDifficultyCard(best, legalCards);
+    rememberBotDecision(
+      playerIndex,
+      chosen,
+      winning: false,
+      leading: false,
+    );
     return chosen;
   }
 
@@ -5263,6 +5027,143 @@ CardModel chooseBotCard(
       }
     }
     return score;
+  }
+
+  // ==========================================================
+  // V1.2.11 PENALTY TARGETING INTELLIGENCE
+  // ==========================================================
+
+  // Returns the known, unplayed penalty cards held by an opponent.
+  // The BOT only uses information it can legitimately know (for example,
+  // cards revealed through the exchange), never hidden cards in an opponent's
+  // hand. Highest-value penalties are considered first.
+  List<CardModel> knownPenaltyTargetsForOpponent(int opponent) {
+    final List<CardModel> targets =
+        (receivedCardsByPlayer[opponent] ?? const <CardModel>[])
+            .where((card) =>
+                card.penalty > 0 &&
+                !playedCardsThisRound.any(
+                  (played) => cardKey(played) == cardKey(card),
+                ))
+            .toList();
+
+    targets.sort((a, b) {
+      final int penaltyCompare = b.penalty.compareTo(a.penalty);
+      if (penaltyCompare != 0) return penaltyCompare;
+      return b.value.compareTo(a.value);
+    });
+
+    return targets;
+  }
+
+  // Checks whether a target penalty card can reasonably become the winner if
+  // this BOT leads a smaller card of the same suit. A known higher card makes
+  // the transfer unsafe. Unknown higher cards reduce confidence but do not
+  // automatically reject the idea.
+  double scorePenaltyTargetLead(
+    int botIndex,
+    CardModel leadCard, {
+    required CardModel target,
+    required int opponent,
+  }) {
+    if (leadCard.suit != target.suit || leadCard.value >= target.value) {
+      return -40;
+    }
+
+    double score = 0;
+
+    // A known higher card held by another player means the target cannot be
+    // expected to win reliably. Treat that target as unsafe.
+    bool knownHigherCard = false;
+    for (int player = 0; player < 4; player++) {
+      if (player == botIndex || player == opponent) continue;
+
+      final List<CardModel> known =
+          receivedCardsByPlayer[player] ?? const <CardModel>[];
+      if (known.any((card) =>
+          card.suit == target.suit &&
+          card.value > target.value &&
+          !playedCardsThisRound.any(
+            (played) => cardKey(played) == cardKey(card),
+          ))) {
+        knownHigherCard = true;
+        break;
+      }
+    }
+
+    if (knownHigherCard) {
+      return -28;
+    }
+
+    final int higherUnseen =
+        cardsHigherThanInUnseen(target.suit, target.value, botIndex);
+
+    // No higher unseen card gives us the strongest confidence. If higher
+    // cards are still unseen, keep the target viable but reduce its value.
+    final double safetyFactor = higherUnseen == 0
+        ? 1.0
+        : 1.0 / (1.0 + higherUnseen * 0.45);
+
+    score += target.penalty * 28.0 * safetyFactor;
+    score += penaltyPriority(target) * 16.0 * safetyFactor;
+
+    // A very small lead is preferable because it leaves the target with more
+    // room to become the winning card without unnecessarily spending control.
+    score += max(0, target.value - leadCard.value) * 0.8;
+
+    // When the opponent is close to elimination, routing a major penalty to
+    // that opponent is especially valuable.
+    if (players[opponent].score >= 94) {
+      score += target.penalty * 22.0 * safetyFactor;
+    } else if (players[opponent].score >= 88) {
+      score += target.penalty * 12.0 * safetyFactor;
+    }
+
+    // In danger mode, prefer a reasonably safe penalty-routing opportunity
+    // over an ordinary lead. This is still subordinate to legality.
+    if (players[botIndex].score >= 94) {
+      score += target.penalty * 18.0 * safetyFactor;
+    }
+
+    return score;
+  }
+
+  // Searches penalty targets in the required order:
+  // Q♠ (12), K♣ (6), J♦ (4), then Hearts (1 each). If the largest target is
+  // not safely transferable, the next target is considered instead.
+  double scorePenaltyTargetingLead(
+    int botIndex,
+    CardModel leadCard,
+  ) {
+    double bestScore = 0;
+
+    for (int opponent = 0; opponent < 4; opponent++) {
+      if (opponent == botIndex) continue;
+
+      final List<CardModel> targets = knownPenaltyTargetsForOpponent(opponent);
+      if (targets.isEmpty()) continue;
+
+      for (final CardModel target in targets) {
+        if (leadCard.suit != target.suit || leadCard.value >= target.value) {
+          continue;
+        }
+
+        final double targetScore = scorePenaltyTargetLead(
+          botIndex,
+          leadCard,
+          target: target,
+          opponent: opponent,
+        );
+
+        // Unsafe targets are deliberately skipped so the engine can move to
+        // the next-largest known penalty instead of forcing a bad lead.
+        if (targetScore <= 0) continue;
+
+        bestScore = max(bestScore, targetScore);
+      }
+    }
+
+    return bestScore;
   }
 
   // ==========================================================
@@ -5480,136 +5381,43 @@ CardModel chooseBotCard(
   }
 
   // ==========================================================
-  // HAND RESULT
-  // ==========================================================
-
-  // Hand-result popup removed for smoother gameplay.
-  // The game now proceeds directly to the next Hand.
-
-  // ==========================================================
   // COMPLETE HAND
   // ==========================================================
 
-  Future<void> showChampionTrophy(int reached100Index) async {
-    if (!mounted) return;
-
-    final List<Player> rankedPlayers = List<Player>.from(players)
-      ..sort((a, b) => a.score.compareTo(b.score));
-    final Player champion = rankedPlayers.first;
-    final List<Player> champions = rankedPlayers
-        .where((player) => player.score == champion.score)
-        .toList();
-    final String championNames = champions.map((p) => p.name).join(' & ');
-
-    await showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) {
-        return AlertDialog(
-          contentPadding: const EdgeInsets.fromLTRB(24, 20, 24, 16),
-          title: Column(
-            children: [
-              TweenAnimationBuilder<double>(
-                tween: Tween<double>(begin: 0.65, end: 1.0),
-                duration: const Duration(milliseconds: 700),
-                curve: Curves.easeOutBack,
-                builder: (context, scale, child) =>
-                    Transform.scale(scale: scale, child: child),
-                child: const Text('🏆', style: TextStyle(fontSize: 64)),
-              ),
-              const SizedBox(height: 4),
-              const Text('GAME OVER', textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900)),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                champions.length == 1
-                    ? '${champion.name} IS THE BREY CHAMPION!'
-                    : 'BREY CHAMPIONS',
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 7),
-              Text(championNames, textAlign: TextAlign.center,
-                  style: const TextStyle(fontSize: 21, fontWeight: FontWeight.w800)),
-              const SizedBox(height: 14),
-              Text('Champion score: ${champion.score} points'),
-              const SizedBox(height: 4),
-              Text('Hands won: ${champion.handsWon}'),
-              const SizedBox(height: 14),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: Colors.amber.shade700),
-                  color: Colors.amber.withValues(alpha: 0.10),
-                ),
-                child: Text(
-                  '${players[reached100Index].name} reached ${players[reached100Index].score} points.\nThe game has ended.',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(fontSize: 13),
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            Center(
-              child: ElevatedButton(
-                onPressed: () {
-                  Navigator.pop(dialogContext);
-                  unawaited(_requestNewGame());
-                },
-                child: const Text('NEW GAME'),
-              ),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  Future<void> completeHand() async {
+  void completeHand() {
     int winnerIndex =
         determineCurrentWinner();
-
-    unawaited(_playFeedback(strongVibration: true));
 
     int handPenalty =
         calculateHandPenalty(winnerIndex);
 
-    // Penalties are scored normally Hand by Hand. The ALL-35 rule is a
-    // Round-level rule: if one player alone collects all 35 penalty points
-    // across the complete Round, those 35 Round points are cancelled at
-    // Round completion.
-    players[winnerIndex].score += handPenalty;
-    if (handPenalty > 0) {
-      unawaited(_playFeedback(strongVibration: handPenalty >= 8));
-    }
-    roundPenaltyByPlayer[winnerIndex] =
-        (roundPenaltyByPlayer[winnerIndex] ?? 0) + handPenalty;
+    // If one player collects every penalty point in the Hand,
+    // that Hand scores 0 points for that player.
+    // The complete deck contains 35 penalty points.
+    final int scoreForHand =
+        handPenalty == 35 ? 0 : handPenalty;
 
-    // V1.13: keep the highest score reached by the human during the
-    // current game. It is stored permanently only when the game ends.
-    if (players[0].score > _highestScoreReached) {
-      _highestScoreReached = players[0].score;
-    }
+    players[winnerIndex].score +=
+        scoreForHand;
 
     players[winnerIndex].handsWon++;
 
+    // Let every BOT learn from the public result of this Hand. The learner
+    // never sees hidden opponent cards; it only updates from the actual
+    // winner and penalty outcome.
+    learnFromCompletedHand(winnerIndex, handPenalty);
+    learnHumanPlayingStyle(winnerIndex, handPenalty);
+    learnOpponentBehavior(winnerIndex, handPenalty);
+
     // ========================================================
-    // GAME OVER AT 100 POINTS
+    // ELIMINATION AFTER HAND IS SCORED
     // ========================================================
 
-    final bool reachedGameEnd = players[winnerIndex].score >= 100;
-    if (reachedGameEnd) {
+    if (
+      players[winnerIndex].score >= 100
+    ) {
       players[winnerIndex].eliminated = true;
-      gameOver = true;
-      roundFinished = true;
-     }
+    }
 
     // ========================================================
     // ♠Q COLLECTOR
@@ -5628,58 +5436,33 @@ CardModel chooseBotCard(
     // MESSAGE
     // ========================================================
 
-    // Do not place the completed-Hand summary in the upper message card.
-    // The four played cards and winner animation already communicate the
-    // result on the table.
-    message = 'Hand $handNumber complete.';
+    String cardsText = currentHand
+        .map(
+          (played) =>
+              '${players[played.playerIndex].name}: ${played.card.shortName}',
+        )
+        .join('   ');
+
+    message =
+        '${players[winnerIndex].name} won Hand $handNumber and received $handPenalty points.\n$cardsText';
 
     // Keep the four cards on the table and begin a short collection
     // animation toward the Hand winner. The scoring above has already
     // happened, so the animation is purely visual.
-    if (mounted) {
-      setState(() {
-        handCollecting = true;
-        collectingWinnerIndex = winnerIndex;
-      });
-    } else {
-      handCollecting = true;
-      collectingWinnerIndex = winnerIndex;
-    }
-
-    // No Hand-result popup: continue directly for smooth gameplay.
-    if (!mounted) return;
+    handCollecting = true;
+    collectingWinnerIndex = winnerIndex;
 
     // ========================================================
-    // GAME OVER / ROUND COMPLETION
+    // ROUND ALWAYS COMPLETES 13 HANDS
     // ========================================================
-
-    if (reachedGameEnd) {
-      unawaited(_playFeedback(strongVibration: true));
-      _recordCompletedGame(reached100Index: winnerIndex);
-      Future.delayed(
-        const Duration(milliseconds: 2000),
-        () async {
-          if (!mounted) return;
-          setState(() {
-            handCollecting = false;
-            collectingWinnerIndex = null;
-          });
-          await showChampionTrophy(winnerIndex);
-        },
-      );
-      return;
-    }
 
     if (handNumber == 13) {
       Future.delayed(
-        const Duration(milliseconds: 2000),
+        const Duration(milliseconds: 2350),
         () {
           if (mounted) {
-            setState(() {
-              handCollecting = false;
-              collectingWinnerIndex = null;
-            });
-            unawaited(_playFeedback(strongVibration: true));
+            handCollecting = false;
+            collectingWinnerIndex = null;
             finishRound();
           }
         },
@@ -5692,14 +5475,8 @@ CardModel chooseBotCard(
     // NEXT HAND
     // ========================================================
 
-    if (!_autoNextHand) {
-      // Leave the result visible until the player explicitly continues.
-      return;
-    }
-
-    final int transitionMs = _animationSpeed == 'fast' ? 1300 : 2350;
     Future.delayed(
-      Duration(milliseconds: transitionMs),
+      const Duration(milliseconds: 2350),
       () {
         if (mounted) {
           startNextHand(winnerIndex);
@@ -5713,22 +5490,20 @@ CardModel chooseBotCard(
   // ==========================================================
 
   void startNextHand(int winnerIndex) {
-    if (!mounted || roundFinished || gameOver) {
-      return;
-    }
+    handCollecting = false;
+    collectingWinnerIndex = null;
+    currentHand.clear();
+    ledSuit = null;
 
-    setState(() {
-      handCollecting = false;
-      collectingWinnerIndex = null;
-      currentHand.clear();
-      ledSuit = null;
-      handNumber++;
+    handNumber++;
 
-      // Winner leads next Hand.
-      currentPlayerIndex = winnerIndex;
-      message =
-          '${players[currentPlayerIndex].name} leads Hand $handNumber.';
-    });
+    // Winner leads next Hand.
+    currentPlayerIndex = winnerIndex;
+
+    message =
+        '${players[currentPlayerIndex].name} leads Hand $handNumber.';
+
+    setState(() {});
 
     if (currentPlayerIndex != 0) {
       Future.delayed(
@@ -5746,27 +5521,86 @@ CardModel chooseBotCard(
   // FINISH ROUND
   // ==========================================================
 
+  void learnFromCompletedRound() {
+    if (!_learningLoaded) return;
 
-  void finishRound() {
-    // ========================================================
-    // ALL 35 PENALTY POINTS IN ONE ROUND = 0
-    // ========================================================
-
-    // The complete Round contains 35 penalty points. If one player alone
-    // collected all 35 during the Round, cancel those 35 points from that
-    // player's total score. This rule applies across the Round, not to a
-    // single Hand.
-    final List<int> allThirtyFiveCollectors = roundPenaltyByPlayer.entries
-        .where((entry) => entry.value == 35)
-        .map((entry) => entry.key)
-        .toList();
-
-    if (allThirtyFiveCollectors.length == 1) {
-      final int collectorIndex = allThirtyFiveCollectors.first;
-      players[collectorIndex].score =
-          max(0, players[collectorIndex].score - 35);
+    int lowestScore = players.first.score;
+    for (final Player player in players) {
+      if (player.score < lowestScore) lowestScore = player.score;
     }
 
+    // V42.46: calibrate learning by final Round rank instead of treating
+    // every non-winning result as equally bad. A narrow second-place finish
+    // should teach a different lesson from a distant fourth-place finish.
+    final List<int> rankedBotIndices = [1, 2, 3]
+      ..sort((int a, int b) =>
+          players[a].score.compareTo(players[b].score));
+
+    for (int playerIndex = 1; playerIndex < 4; playerIndex++) {
+      // One completed Round supplies one additional public outcome sample.
+      // Keep the count bounded so persistence remains tiny and stable.
+      gameOutcomeExperience[playerIndex] =
+          ((gameOutcomeExperience[playerIndex] ?? 0) + 1).clamp(0, 200);
+
+      final int score = players[playerIndex].score;
+      final int rank = rankedBotIndices.indexOf(playerIndex);
+      final double rankOutcome = switch (rank) {
+        0 => 1.0,
+        1 => 0.25,
+        2 => -0.50,
+        _ => -1.0,
+      };
+      final double scoreGap =
+          ((score - lowestScore).clamp(0, 35) / 35.0);
+      final double outcome = rank == 0
+          ? 1.0
+          : (rankOutcome - (scoreGap * 0.35)).clamp(-1.0, 1.0);
+      final double oldValue = gameOutcomeWeights[playerIndex] ?? 0.0;
+      gameOutcomeWeights[playerIndex] =
+          ((oldValue * 0.90) + (outcome * 0.10)).clamp(-8.0, 8.0).toDouble();
+
+      final Map<String, double> memory =
+          learnedDecisionWeights[playerIndex] ?? <String, double>{};
+      final double calibration = gameOutcomeWeights[playerIndex]! * 0.01;
+      memory.updateAll((String key, double value) =>
+          (value + calibration).clamp(-8.0, 8.0).toDouble());
+      learnedDecisionWeights[playerIndex] = memory;
+    }
+
+    _saveAdaptiveLearning();
+  }
+
+  double scoreGameLevelLearning(
+    int playerIndex,
+    CardModel candidate, {
+    required bool winning,
+    required bool leading,
+  }) {
+    if (!_learningLoaded) return 0.0;
+
+    final double gameWeight = gameOutcomeWeights[playerIndex] ?? 0.0;
+    if (gameWeight == 0.0) return 0.0;
+
+    // V42.45: confidence ramps in gradually. A BOT with only one or two
+    // completed Rounds should not suddenly rewrite its strategy because of
+    // one unusual result. The model becomes fully trusted after 10 Rounds.
+    final int experience = gameOutcomeExperience[playerIndex] ?? 0;
+    final double confidence = (experience / 10.0).clamp(0.0, 1.0);
+    if (confidence == 0.0) return 0.0;
+
+    final double learned = scoreLearnedExperience(
+      playerIndex,
+      candidate,
+      winning: winning,
+      leading: leading,
+    );
+
+    final double multiplier = 1.0 + (gameWeight * 0.05 * confidence);
+    return learned * (multiplier - 1.0);
+  }
+
+
+  void finishRound() {
     // ========================================================
     // ZERO HANDS WON = -5
     // SCORE NEVER BELOW ZERO
@@ -5778,6 +5612,9 @@ CardModel chooseBotCard(
             max(0, player.score - 5);
       }
     }
+
+    // V42.44: learn from the complete Round result.
+    learnFromCompletedRound();
 
     // ========================================================
     // LOWEST SCORE
@@ -5823,17 +5660,11 @@ CardModel chooseBotCard(
   // START NEXT ROUND
   // ==========================================================
 
-  Future<void> startNextRound() async {
-    if (gameOver || dealingPhase || exchangePhase) {
-      return;
-    }
-
+  void startNextRound() {
     if (spadeQueenCollector == null) {
       message =
           '♠Q collector was not found.';
-      if (mounted) {
-        setState(() {});
-      }
+      setState(() {});
       return;
     }
 
@@ -5847,21 +5678,11 @@ CardModel chooseBotCard(
       player.handsWon = 0;
     }
 
-    // Leave the Round summary immediately and let dealRound() publish
-    // the dealing screen after the dealer confirms SHUFFLE & DEAL.
     roundFinished = false;
-    dealingPhase = false;
-    exchangePhase = false;
-    currentHand.clear();
-    ledSuit = null;
-    handCollecting = false;
-    collectingWinnerIndex = null;
 
-    if (mounted) {
-      setState(() {});
-    }
+    dealRound();
 
-    await dealRound();
+    setState(() {});
   }
 
   // ==========================================================
@@ -5900,26 +5721,16 @@ CardModel chooseBotCard(
   // CARD WIDGET
   // ==========================================================
 
-  Duration _cardAnimationDuration(int normalMs) {
-    if (!_cardAnimationEnabled) {
-      return Duration.zero;
-    }
-    final int ms = _animationSpeed == 'fast'
-        ? (normalMs * 0.55).round()
-        : normalMs;
-    return Duration(milliseconds: ms.clamp(0, 3000));
-  }
-
-  Future<void> _requestNewGame() async {
-    startNewGame();
-  }
-
   Widget buildCard(
     CardModel card, {
     required bool exchangeMode,
   }) {
-    final bool selected = selectedExchangeCards.contains(card);
+    final bool selected =
+        selectedExchangeCards.contains(card);
 
+    // During normal play, lift every card that is currently legal.
+    // This gives the player an immediate visual cue about what can
+    // be played without changing the underlying game rules.
     final bool playableNow =
         gameStarted &&
         !exchangeMode &&
@@ -5928,25 +5739,20 @@ CardModel chooseBotCard(
         isLegalCard(0, card);
 
     final bool red =
-        card.suit == 'Hearts' || card.suit == 'Diamonds';
+        card.suit == 'Hearts' ||
+        card.suit == 'Diamonds';
 
     final Color suitColor =
         red ? const Color(0xffb42318) : const Color(0xff17202a);
 
-    // Premium physical-card motion: selected cards rise clearly, while
-    // playable cards get only a restrained hover lift.
-    final double lift = selected
-        ? -0.125
-        : playableNow
-            ? -0.060
-            : 0.0;
+    final double lift =
+        selected
+            ? -0.11
+            : playableNow
+                ? -0.055
+                : 0.0;
 
-    final double selectedGlow = selected ? 0.22 : (playableNow ? 0.08 : 0.0);
-
-    final bool penaltyCard = card.penalty > 0;
-
-    return RepaintBoundary(
-      child: GestureDetector(
+    return GestureDetector(
       onTap: () {
         if (exchangeMode) {
           toggleExchangeCard(card);
@@ -5955,15 +5761,15 @@ CardModel chooseBotCard(
         }
       },
       child: AnimatedScale(
-        scale: selected ? 1.055 : (playableNow ? 1.012 : 1.0),
-        duration: selected ? _cardAnimationDuration(190) : Duration.zero,
+        scale: selected ? 1.055 : (playableNow ? 1.01 : 1.0),
+        duration: const Duration(milliseconds: 220),
         curve: Curves.easeOutCubic,
         child: AnimatedSlide(
           offset: Offset(0, lift),
-          duration: selected ? _cardAnimationDuration(210) : Duration.zero,
+          duration: const Duration(milliseconds: 240),
           curve: Curves.easeOutCubic,
           child: AnimatedContainer(
-            duration: selected ? _cardAnimationDuration(190) : Duration.zero,
+            duration: const Duration(milliseconds: 220),
             curve: Curves.easeOutCubic,
             width: 70,
             height: 102,
@@ -5977,147 +5783,67 @@ CardModel chooseBotCard(
                 end: Alignment.bottomRight,
                 colors: [
                   Color(0xffffffff),
-                  Color(0xfff5f2eb),
+                  Color(0xfff7f5f0),
                 ],
               ),
               borderRadius: BorderRadius.circular(12),
               border: Border.all(
                 color: selected
                     ? const Color(0xffb58b2a)
-                    : playableNow
-                        ? const Color(0xffc8a45d)
-                        : const Color(0xffd0cbc1),
-                width: selected ? 2.5 : (playableNow ? 1.4 : 1),
+                    : const Color(0xffd7d2c8),
+                width: selected ? 2.5 : 1,
               ),
               boxShadow: [
                 BoxShadow(
                   color: Colors.black.withValues(
-                    alpha: selected ? 0.28 : 0.15,
+                    alpha: selected ? 0.24 : 0.14,
                   ),
-                  blurRadius: selected ? 11 : 4,
-                  spreadRadius: selected ? 1.2 : 0,
-                  offset: const Offset(0, 4),
+                  blurRadius: selected ? 10 : 6,
+                  spreadRadius: selected ? 1 : 0,
+                  offset: const Offset(0, 3),
                 ),
-                if (selected)
-                  BoxShadow(
-                    color: const Color(0xffd4af63).withValues(
-                      alpha: selectedGlow,
-                    ),
-                    blurRadius: 16,
-                    spreadRadius: 2,
-                  ),
               ],
             ),
             child: Stack(
               children: [
-                // Soft moving highlight makes the selected card feel lifted
-                // without adding a flashy effect.
-                Positioned.fill(
-                  child: IgnorePointer(
-                    child: Opacity(
-                      opacity: selected ? 1.0 : 0.0,
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(12),
-                          gradient: LinearGradient(
-                            begin: Alignment.topLeft,
-                            end: Alignment.center,
-                            colors: [
-                              Colors.white.withValues(alpha: 0.30),
-                              Colors.transparent,
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-
-                // Very subtle inner frame for a more physical card feel.
-                Positioned.fill(
-                  child: IgnorePointer(
-                    child: Container(
-                      margin: const EdgeInsets.all(3),
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(9),
-                        border: Border.all(
-                          color: const Color(0xffe6e1d7),
-                          width: 0.7,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-
-                // Clean top-left index: rank only. The large center suit
-                // remains the card's visual suit indicator.
+                // Simple classic card face: rank at top-left.
                 Positioned(
                   left: 8,
-                  top: 6,
+                  top: 7,
                   child: Text(
                     card.rank,
                     style: TextStyle(
-                      fontSize: 17,
-                      height: 0.95,
-                      fontWeight: FontWeight.w900,
+                      fontSize: 18,
+                      height: 1,
+                      fontWeight: FontWeight.w800,
                       color: suitColor,
                     ),
                   ),
                 ),
 
-                // Large central suit mark.
+                // One single suit symbol in the centre.
                 Center(
-                  child: Text(
-                    card.symbol,
+                  child: AnimatedDefaultTextStyle(
+                    duration: const Duration(milliseconds: 180),
+                    curve: Curves.easeOutCubic,
                     style: TextStyle(
                       fontSize: selected ? 43 : 40,
                       height: 1,
                       color: suitColor,
                       fontWeight: FontWeight.w500,
                     ),
+                    child: Text(card.symbol),
                   ),
                 ),
 
-                // Penalty value is deliberately small so it does not
-                // interfere with the traditional card face.
-                if (penaltyCard)
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    bottom: 4,
-                    child: Center(
-                      child: Opacity(
-                        opacity: selected ? 1.0 : 0.78,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 5,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: suitColor.withValues(alpha: 0.09),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Text(
-                            '+${card.penalty}',
-                            style: TextStyle(
-                              color: suitColor,
-                              fontSize: 8,
-                              fontWeight: FontWeight.w800,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-
-                // Selection check animates in instead of appearing abruptly.
+                // Smooth selection indicator.
                 Positioned(
                   right: 5,
                   top: 5,
                   child: AnimatedScale(
                     scale: selected ? 1.0 : 0.0,
-                    duration: const Duration(milliseconds: 170),
-                    curve: Curves.easeOutCubic,
+                    duration: const Duration(milliseconds: 160),
+                    curve: Curves.easeOutBack,
                     child: Container(
                       width: 18,
                       height: 18,
@@ -6137,7 +5863,6 @@ CardModel chooseBotCard(
             ),
           ),
         ),
-      ),
       ),
     );
   }
@@ -6166,7 +5891,7 @@ CardModel chooseBotCard(
                 title: const Text('START NEW GAME'),
                 onTap: () {
                   Navigator.pop(dialogContext);
-                  unawaited(_requestNewGame());
+                  startNewGame();
                 },
               ),
               ListTile(
@@ -6187,7 +5912,7 @@ CardModel chooseBotCard(
                   Navigator.pop(dialogContext);
                   setState(() {
                     gameStarted = false;
-                                   dealingPhase = false;
+                    dealingPhase = false;
                     exchangePhase = false;
                     handCollecting = false;
                     collectingWinnerIndex = null;
@@ -6377,18 +6102,11 @@ CardModel chooseBotCard(
                     child: Column(
                       children: [
                         Text(
-                          player.isHuman
-                              ? _playerAvatars[player.avatarIndex.clamp(0, _playerAvatars.length - 1).toInt()]['emoji']!
-                              : _botAvatarForPlayer(player),
-                          style: const TextStyle(fontSize: 23),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          player.name,
+                          player.name == 'YOU' ? 'YOU' : player.name,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
-                            color: player.isHuman
+                            color: player.name == 'YOU'
                                 ? const Color(0xfff2d38b)
                                 : Colors.white70,
                             fontSize: 10,
@@ -6622,108 +6340,53 @@ CardModel chooseBotCard(
   // ==========================================================
 
   Widget buildPlayedCardTile(PlayedCard played) {
-    final bool red =
-        played.card.suit == 'Hearts' ||
+    bool red = played.card.suit == 'Hearts' ||
         played.card.suit == 'Diamonds';
 
-    final Color suitColor =
-        red ? const Color(0xffb42318) : const Color(0xff17202a);
-
-    // Each newly played card enters with a short lift-and-scale animation.
-    return TweenAnimationBuilder<double>(
-      key: ValueKey('${played.playerIndex}-${played.card.shortName}'),
-      tween: Tween<double>(begin: 0.84, end: 1.0),
-      duration: _cardAnimationDuration(320),
-      curve: Curves.easeOutBack,
-      builder: (context, scale, child) {
-        return Transform.scale(
-          scale: scale,
-          child: child,
-        );
-      },
-      child: Container(
-        width: 72,
-        height: 92,
-        margin: const EdgeInsets.all(4),
-        decoration: BoxDecoration(
-          gradient: const LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [
-              Color(0xffffffff),
-              Color(0xfff4f1e9),
-            ],
+    return Container(
+      width: 72,
+      height: 92,
+      margin: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.black26),
+        boxShadow: const [
+          BoxShadow(
+            blurRadius: 4,
+            offset: Offset(0, 2),
           ),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(
-            color: const Color(0xffd0cbc1),
+        ],
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Text(
+            players[played.playerIndex].name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.bold,
+            ),
           ),
-          boxShadow: const [
-            BoxShadow(
-              color: Color(0x33000000),
-              blurRadius: 7,
-              offset: Offset(0, 3),
+          const SizedBox(height: 3),
+          Text(
+            played.card.rank,
+            style: TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+              color: red ? Colors.red : Colors.black,
             ),
-          ],
-        ),
-        child: Stack(
-          children: [
-            Positioned.fill(
-              child: IgnorePointer(
-                child: Container(
-                  margin: const EdgeInsets.all(3),
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                      color: Color(0xffe5e0d7),
-                      width: 0.7,
-                    ),
-                  ),
-                ),
-              ),
+          ),
+          Text(
+            played.card.symbol,
+            style: TextStyle(
+              fontSize: 24,
+              color: red ? Colors.red : Colors.black,
             ),
-            // Clean top-left index: rank only.
-            Positioned(
-              left: 7,
-              top: 5,
-              child: Text(
-                played.card.rank,
-                style: TextStyle(
-                  fontSize: 16,
-                  height: 0.95,
-                  fontWeight: FontWeight.w900,
-                  color: suitColor,
-                ),
-              ),
-            ),
-            Center(
-              child: Text(
-                played.card.symbol,
-                style: TextStyle(
-                  fontSize: 31,
-                  color: suitColor,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-            ),
-            Positioned(
-              left: 4,
-              right: 4,
-              bottom: 3,
-              child: Text(
-                players[played.playerIndex].name,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  fontSize: 8,
-                  fontWeight: FontWeight.w800,
-                  color: const Color(0xff30302d),
-                ),
-              ),
-            ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -6736,85 +6399,26 @@ CardModel chooseBotCard(
     final bool isTurn = currentPlayerIndex == index && !roundFinished;
     final bool isDealer = dealerIndex == index;
 
-    // Keep player labels readable against both the dark BREY table and
-    // the light card faces.  The label gets its own opaque-ish surface so
-    // the player's name never relies on the background behind it for contrast.
-    final Color labelBackground = isTurn
-        ? const Color(0xff4a3a1d).withValues(alpha: 0.94)
-        : const Color(0xff102c25).withValues(alpha: 0.94);
-    final Color labelTextColor = isTurn
-        ? const Color(0xffffe4a3)
-        : const Color(0xfff4f1e8);
-    final Color secondaryTextColor = isTurn
-        ? const Color(0xffffd36e)
-        : const Color(0xffd7d4ca);
-
-    return Container(
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 220),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(18),
         border: Border.all(
-          color: isTurn ? const Color(0xffe3c27a) : const Color(0xffd4af63).withValues(alpha: 0.34),
+          color: isTurn ? const Color(0xffe3c27a) : Colors.white.withValues(alpha: 0.18),
           width: isTurn ? 1.6 : 1,
         ),
-        color: labelBackground,
-        boxShadow: isTurn
-            ? [
-                BoxShadow(
-                  color: const Color(0xffd4af63).withValues(alpha: 0.16),
-                  blurRadius: 12,
-                ),
-              ]
-            : const [],
+        color: isTurn ? const Color(0xffd4af63).withValues(alpha: 0.16) : Colors.black.withValues(alpha: 0.13),
+        boxShadow: isTurn ? [BoxShadow(color: const Color(0xffd4af63).withValues(alpha: 0.14), blurRadius: 12)] : const [],
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (player.isHuman)
-            Text(
-              _playerAvatars[player.avatarIndex.clamp(0, _playerAvatars.length - 1).toInt()]['emoji']!,
-              style: const TextStyle(fontSize: 17),
-            )
-          else
-            Icon(
-              position == 'bottom' ? Icons.account_circle_outlined : Icons.person_outline,
-              size: 17,
-              color: isTurn ? const Color(0xfff0d48e) : Colors.white70,
-            ),
+          Icon(position == 'bottom' ? Icons.account_circle_outlined : Icons.person_outline, size: 17, color: isTurn ? const Color(0xfff0d48e) : Colors.white70),
           const SizedBox(width: 5),
-          Text(
-            player.name,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: labelTextColor,
-              fontSize: 12,
-              fontWeight: isTurn ? FontWeight.w800 : FontWeight.w700,
-              letterSpacing: 0.15,
-            ),
-          ),
-          if (isDealer) ...[
-            const SizedBox(width: 5),
-            Text(
-              'D',
-              style: TextStyle(
-                color: secondaryTextColor,
-                fontSize: 10,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ],
-          if (player.eliminated) ...[
-            const SizedBox(width: 5),
-            const Text(
-              'OUT',
-              style: TextStyle(
-                color: Color(0xffffb4b4),
-                fontSize: 9,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ],
+          Text(player.name, style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: isTurn ? FontWeight.w800 : FontWeight.w600)),
+          if (isDealer) ...[const SizedBox(width: 5), const Text('D', style: TextStyle(color: Color(0xffe3c27a), fontSize: 10, fontWeight: FontWeight.w800))],
+          if (player.eliminated) ...[const SizedBox(width: 5), const Text('OUT', style: TextStyle(color: Color(0xffffb4b4), fontSize: 9, fontWeight: FontWeight.w800))],
           if (isTurn) ...[const SizedBox(width: 5), const Icon(Icons.circle, size: 6, color: Color(0xffe3c27a))],
         ],
       ),
@@ -6922,41 +6526,37 @@ CardModel chooseBotCard(
                   collectingWinnerIndex!,
                 );
 
-      Widget displayedCard = cardWidget;
-
-      // Keep the normal table path completely static. The collection
-      // animation is the only time these cards need an animation widget.
-      // This prevents four animation controllers/tween states from being
-      // rebuilt on every ordinary card play.
-      if (handCollecting) {
-        displayedCard = TweenAnimationBuilder<Offset>(
-          tween: Tween<Offset>(
-            begin: const Offset(0, 0),
-            end: collectionTarget,
-          ),
-          duration: const Duration(milliseconds: 650),
-          curve: Curves.easeInOutCubic,
-          builder: (context, offset, child) {
-            return Transform.translate(
-              offset: Offset(offset.dx * 34, offset.dy * 32),
-              child: Opacity(
-                opacity: 0.18,
-                child: Transform.scale(
-                  scale: isWinnerCard ? 1.10 : 1.0,
-                  child: child,
+      return SizedBox(
+        width: 84,
+        height: 98,
+        child: Center(
+          child: TweenAnimationBuilder<Offset>(
+            tween: Tween<Offset>(
+              begin: const Offset(0, 0),
+              end: handCollecting
+                  ? collectionTarget
+                  : const Offset(0, 0),
+            ),
+            duration: const Duration(milliseconds: 1800),
+            curve: Curves.easeInOutCubic,
+            builder: (context, offset, child) {
+              return Transform.translate(
+                offset: Offset(offset.dx * 34, offset.dy * 32),
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 1800),
+                  curve: Curves.easeInCubic,
+                  opacity: handCollecting ? 0.18 : 1.0,
+                  child: AnimatedScale(
+                    duration: const Duration(milliseconds: 360),
+                    curve: Curves.easeOutBack,
+                    scale: isWinnerCard ? 1.10 : 1.0,
+                    child: child,
+                  ),
                 ),
-              ),
-            );
-          },
-          child: cardWidget,
-        );
-      }
-
-      return RepaintBoundary(
-        child: SizedBox(
-          width: 84,
-          height: 98,
-          child: Center(child: displayedCard),
+              );
+            },
+            child: cardWidget,
+          ),
         ),
       );
     }
@@ -7008,34 +6608,14 @@ CardModel chooseBotCard(
             ),
           const SizedBox(height: 4),
           if (ledSuit != null)
-            Text(
-              'LED  $ledSymbol',
-              style: TextStyle(
-                color: ledSuit == 'Hearts' || ledSuit == 'Diamonds'
-                    ? const Color(0xffff9da8)
-                    : const Color(0xfff2efe5),
-                fontSize: 11,
-                fontWeight: FontWeight.w800,
-                letterSpacing: 0.8,
-              ),
-            )
+            Text('LED  $ledSymbol', style: TextStyle(color: ledSuit == 'Hearts' || ledSuit == 'Diamonds' ? const Color(0xffffc4c4) : Colors.white70, fontSize: 10, fontWeight: FontWeight.w600))
           else
-            const Text(
-              'NO SUIT LED',
-              style: TextStyle(
-                color: Colors.white70,
-                fontSize: 9,
-                fontWeight: FontWeight.w600,
-                letterSpacing: 0.7,
-              ),
-            ),
+            const Text('NO SUIT LED', style: TextStyle(color: Colors.white54, fontSize: 9, letterSpacing: 0.7)),
           const SizedBox(height: 4),
           Text(
-              '${currentHand.length} / 4 CARDS',
-              style: const TextStyle(
-                color: Colors.white70,
+              '${currentHand.length} / 4 CARDS',              style: const TextStyle(
+                color: Colors.white54,
                 fontSize: 9,
-                fontWeight: FontWeight.w600,
                 letterSpacing: 0.8,
               ),
             ),
@@ -7043,10 +6623,7 @@ CardModel chooseBotCard(
       ),
     );
 
-    return RepaintBoundary(
-      child: Container(
-      margin: const EdgeInsets.symmetric(vertical: 2),
-      padding: const EdgeInsets.symmetric(vertical: 7),
+    return Container(        margin: const EdgeInsets.symmetric(vertical: 2),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(28),
         gradient: const LinearGradient(
@@ -7119,8 +6696,7 @@ CardModel chooseBotCard(
           ],
         ),
       ),
-      ),
-    );
+      );
   }
 
   // ==========================================================
@@ -7136,210 +6712,158 @@ CardModel chooseBotCard(
         .where((player) => player.score == lowestScore)
         .toList();
 
-    // V1.4: The completed Round enters as a single calm reveal. This is
-    // intentionally animation-only; all scores and game state were already
-    // finalized by finishRound().
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: 0.94, end: 1.0),
-      duration: const Duration(milliseconds: 420),
-      curve: Curves.easeOutCubic,
-      builder: (context, scale, child) {
-        return Opacity(
-          opacity: ((scale - 0.94) / 0.06).clamp(0.0, 1.0),
-          child: Transform.scale(
-            scale: scale,
-            child: child,
-          ),
-        );
-      },
-      child: Card(
-        elevation: 5,
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            children: [
-              const Text(
-                'ROUND COMPLETE',
-                style: TextStyle(
-                  fontSize: 25,
-                  fontWeight: FontWeight.bold,
-                ),
+    return Card(
+      elevation: 5,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            const Text(
+              'ROUND COMPLETE',
+              style: TextStyle(
+                fontSize: 25,
+                fontWeight: FontWeight.bold,
               ),
-              const SizedBox(height: 6),
-              Text(
-                'Round $roundNumber — Final Scores',
-                style: const TextStyle(
-                  fontSize: 15,
-                  color: Colors.black54,
-                ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Round $roundNumber — Final Scores',
+              style: const TextStyle(
+                fontSize: 15,
+                color: Colors.black54,
               ),
-              const SizedBox(height: 14),
+            ),
+            const SizedBox(height: 14),
 
-              ...sortedPlayers.asMap().entries.map((entry) {
-                final position = entry.key + 1;
-                final player = entry.value;
-                final isChampion = player.score == lowestScore;
+            ...sortedPlayers.asMap().entries.map((entry) {
+              final position = entry.key + 1;
+              final player = entry.value;
+              final isChampion = player.score == lowestScore;
 
-                return TweenAnimationBuilder<double>(
-                  tween: Tween<double>(begin: 0.0, end: 1.0),
-                  duration: Duration(milliseconds: 300 + (position * 70)),
-                  curve: Curves.easeOutCubic,
-                  builder: (context, value, child) {
-                    return Opacity(
-                      opacity: value,
-                      child: Transform.translate(
-                        offset: Offset(0, 10 * (1 - value)),
-                        child: child,
-                      ),
-                    );
-                  },
-                  child: Container(
-                    margin: const EdgeInsets.only(bottom: 8),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 10,
-                    ),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(
-                        color: isChampion
-                            ? Colors.amber.shade700
-                            : Colors.black12,
-                      ),
-                      color: isChampion
-                          ? Colors.amber.withValues(alpha: 0.12)
-                          : Colors.transparent,
-                    ),
-                    child: Row(
-                      children: [
-                        SizedBox(
-                          width: 34,
-                          child: Text(
-                            '#$position',
-                            style: const TextStyle(
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                player.name,
-                                style: const TextStyle(
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                              Text(
-                                '${player.handsWon} Hands won',
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.black54,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        TweenAnimationBuilder<int>(
-                          tween: IntTween(begin: 0, end: player.score),
-                          duration: const Duration(milliseconds: 900),
-                          curve: Curves.easeOutCubic,
-                          builder: (context, animatedScore, child) {
-                            return Text(
-                              '$animatedScore',
-                              style: TextStyle(
-                                fontSize: 21,
-                                fontWeight: FontWeight.bold,
-                                color: player.score >= 100
-                                    ? Colors.red
-                                    : Colors.black,
-                              ),
-                            );
-                          },
-                        ),
-                        const SizedBox(width: 4),
-                        const Text('pts'),
-                      ],
-                    ),
+              return Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: isChampion
+                        ? Colors.amber.shade700
+                        : Colors.black12,
                   ),
-                );
-              }),
-
-              const SizedBox(height: 8),
-              TweenAnimationBuilder<double>(
-                tween: Tween<double>(begin: 0.0, end: 1.0),
-                duration: const Duration(milliseconds: 850),
-                curve: Curves.easeOutBack,
-                builder: (context, value, child) {
-                  return Opacity(
-                    opacity: value.clamp(0.0, 1.0),
-                    child: Transform.scale(
-                      scale: 0.94 + (0.06 * value),
-                      child: child,
-                    ),
-                  );
-                },
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: Colors.amber.shade700),
-                  ),
-                  child: Column(
-                    children: [
-                      Text(
-                        champions.length == 1
-                            ? '🏆 ${champions.first.name} IS THE BREY CHAMPION!'
-                            : '🏆 BREY CHAMPIONS',
-                        textAlign: TextAlign.center,
+                  color: isChampion
+                      ? Colors.amber.withValues(alpha: 0.12)
+                      : Colors.transparent,
+                ),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 34,
+                      child: Text(
+                        '#$position',
                         style: const TextStyle(
-                          fontSize: 18,
                           fontWeight: FontWeight.bold,
                         ),
                       ),
-                      if (champions.length > 1) ...[
-                        const SizedBox(height: 5),
-                        Text(
-                          champions.map((p) => p.name).join(', '),
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(fontSize: 16),
-                        ),
-                      ],
-                      const SizedBox(height: 4),
-                      Text(
-                        'Lowest score: $lowestScore points',
-                        style: const TextStyle(fontSize: 14),
+                    ),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            player.name,
+                            style: const TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          Text(
+                            '${player.handsWon} Hands won',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: Colors.black54,
+                            ),
+                          ),
+                        ],
                       ),
-                    ],
+                    ),
+                    Text(
+                      '${player.score}',
+                      style: TextStyle(
+                        fontSize: 21,
+                        fontWeight: FontWeight.bold,
+                        color: player.score >= 100
+                            ? Colors.red
+                            : Colors.black,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    const Text('pts'),
+                  ],
+                ),
+              );
+            }),
+
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.amber.shade700),
+              ),
+              child: Column(
+                children: [
+                  Text(
+                    champions.length == 1
+                        ? '🏆 ${champions.first.name} IS THE BREY CHAMPION!'
+                        : '🏆 BREY CHAMPIONS',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
-                ),
+                  if (champions.length > 1) ...[
+                    const SizedBox(height: 5),
+                    Text(
+                      champions.map((p) => p.name).join(', '),
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 16),
+                    ),
+                  ],
+                  const SizedBox(height: 4),
+                  Text(
+                    'Lowest score: $lowestScore points',
+                    style: const TextStyle(fontSize: 14),
+                  ),
+                ],
               ),
+            ),
 
-              const SizedBox(height: 12),
-              Text(
-                message,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  fontSize: 13,
-                  color: Colors.black54,
-                ),
+            const SizedBox(height: 12),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontSize: 13,
+                color: Colors.black54,
               ),
-              const SizedBox(height: 16),
+            ),
+            const SizedBox(height: 16),
 
-              ElevatedButton(
-                onPressed: startNextRound,
-                child: const Text('START NEXT ROUND'),
-              ),
-              const SizedBox(height: 8),
-              OutlinedButton(
-                onPressed: _requestNewGame,
-                child: const Text('NEW GAME'),
-              ),
-            ],
-          ),
+            ElevatedButton(
+              onPressed: startNextRound,
+              child: const Text('START NEXT ROUND'),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton(
+              onPressed: startNewGame,
+              child: const Text('NEW GAME'),
+            ),
+          ],
         ),
       ),
     );
@@ -7426,14 +6950,9 @@ CardModel chooseBotCard(
           const SizedBox(height: 8),
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
-            child: DefaultTextStyle(
-              style: const TextStyle(
-                color: Colors.black87,
-              ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: children,
-              ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: children,
             ),
           ),
           const SizedBox(height: 8),
@@ -7443,7 +6962,6 @@ CardModel chooseBotCard(
             style: const TextStyle(
               fontSize: 12.5,
               height: 1.35,
-              color: Colors.black87,
             ),
           ),
         ],
@@ -7479,17 +6997,10 @@ CardModel chooseBotCard(
                         child: const Icon(Icons.menu_book_rounded, color: Colors.white),
                       ),
                       const SizedBox(width: 12),
-                      Expanded(
+                      const Expanded(
                         child: Text(
                           'BREY RULE BOOK',
-                          style: TextStyle(
-                            fontSize: 23,
-                            fontWeight: FontWeight.bold,
-                            letterSpacing: 0.5,
-                            color: Theme.of(context).brightness == Brightness.dark
-                                ? Colors.white
-                                : Colors.black87,
-                          ),
+                          style: TextStyle(fontSize: 23, fontWeight: FontWeight.bold, letterSpacing: 0.5),
                         ),
                       ),
                       IconButton(
@@ -7666,8 +7177,8 @@ CardModel chooseBotCard(
                         ),
 
                         _ruleVisual(
-                          title: 'NEW RULE — ALL 35 POINTS IN ONE ROUND',
-                          explanation: 'If one player alone collects ALL 35 penalty points across the complete Round, all 35 of those Round penalty points are cancelled and that player gets 0 points from that Round penalty pool. The rule applies across the entire Round, not to a single Hand.',
+                          title: 'NEW RULE — ALL 35 POINTS IN ONE HAND',
+                          explanation: 'If one player collects ALL 35 penalty points in a single Hand, that player gets 0 points for that Hand. This is a special reward for taking all the penalties at once.',
                           children: [
                             _ruleCardVisual(rank: 'Q', suit: 'Spades', highlighted: true),
                             _ruleCardVisual(rank: 'K', suit: 'Clubs', highlighted: true),
@@ -7682,7 +7193,7 @@ CardModel chooseBotCard(
 
                         _ruleSection(
                           '14. SCORING',
-                          'The player who wins a Hand collects the penalty points in that Hand. At the end of the Round, if one player alone has collected all 35 penalty points across Hands 1–13, those 35 Round penalty points are cancelled, so that player receives 0 points from those penalties for the Round.',
+                          'The player who wins a Hand collects all penalty points in that Hand. SPECIAL RULE: if that player collects all 35 penalty points in one Hand, the Hand gives them 0 points instead of 35.',
                         ),
 
                         _ruleVisual(
@@ -7706,8 +7217,8 @@ CardModel chooseBotCard(
                         ),
 
                         _ruleSection(
-                          '16. GAME OVER & CHAMPION',
-                          'The game ends immediately after a Hand is scored if any player reaches 100 or more points. The player or players with the lowest score at that moment are the BREY Champion(s). Ties for the lowest score are allowed. A trophy appears with the champion details.',
+                          '16. ELIMINATION & CHAMPION',
+                          'A player reaching 100 or more points is eliminated after that Hand is scored. They continue playing normally until the Round ends. More than one player can be eliminated in the same Round. After all 13 Hands, the player or players with the lowest final score are the BREY Champion(s). Ties for the lowest score are allowed.',
                         ),
 
                         const SizedBox(height: 8),
@@ -7729,17 +7240,7 @@ CardModel chooseBotCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            title,
-            style: TextStyle(
-              fontSize: 15,
-              fontWeight: FontWeight.bold,
-              letterSpacing: 0.4,
-              color: Theme.of(context).brightness == Brightness.dark
-                  ? Colors.white
-                  : Colors.black87,
-            ),
-          ),
+          Text(title, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, letterSpacing: 0.4, color: Color(0xff172554))),
           const SizedBox(height: 5),
           Text(text, style: const TextStyle(fontSize: 14, height: 1.45)),
         ],
@@ -7796,13 +7297,10 @@ CardModel chooseBotCard(
 
     _isBackGameMenuOpen = true;
 
-    final action = await showGeneralDialog<String>(
+    final action = await showDialog<String>(
       context: context,
       barrierDismissible: true,
-      barrierLabel: 'Leave game',
-      barrierColor: Colors.black54,
-      transitionDuration: Duration.zero,
-      pageBuilder: (dialogContext, animation, secondaryAnimation) {
+      builder: (dialogContext) {
         return AlertDialog(
           title: const Text(
             'LEAVE GAME?',
@@ -7874,7 +7372,7 @@ CardModel chooseBotCard(
     if (action == 'home') {
       setState(() {
         gameStarted = false;
-           dealingPhase = false;
+        dealingPhase = false;
         exchangePhase = false;
         handCollecting = false;
         collectingWinnerIndex = null;
@@ -7884,871 +7382,13 @@ CardModel chooseBotCard(
     }
 
     if (action == 'new') {
-      unawaited(_requestNewGame());
+      startNewGame();
       return;
     }
 
     if (action == 'exit') {
       await SystemNavigator.pop();
     }
-  }
-
-
-  // ==========================================================
-  // PLAYER GAME STATISTICS — V1.13
-  // ==========================================================
-
-  Future<void> _loadGameStatistics() async {
-    try {
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-      if (!mounted) return;
-      setState(() {
-        _gamesPlayed = prefs.getInt(_gamesPlayedStorageKey) ?? 0;
-        _gamesWon = prefs.getInt(_gamesWonStorageKey) ?? 0;
-        _gamesLost = prefs.getInt(_gamesLostStorageKey) ?? 0;
-        _totalHandsPlayed = prefs.getInt(_totalHandsPlayedStorageKey) ?? 0;
-        _totalHandsWon = prefs.getInt(_totalHandsWonStorageKey) ?? 0;
-        _bestScore = prefs.getInt(_bestScoreStorageKey) ?? -1;
-        _totalPenaltyPointsReceived =
-            prefs.getInt(_totalPenaltyStorageKey) ?? 0;
-        _highestScoreReached = prefs.getInt(_highestScoreStorageKey) ?? 0;
-        _gameStatsLoaded = true;
-      });
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _gameStatsLoaded = true;
-      });
-    }
-  }
-
-  Future<void> _saveGameStatistics() async {
-    if (!_gameStatsLoaded) return;
-    try {
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-      await prefs.setInt(_gamesPlayedStorageKey, _gamesPlayed);
-      await prefs.setInt(_gamesWonStorageKey, _gamesWon);
-      await prefs.setInt(_gamesLostStorageKey, _gamesLost);
-      await prefs.setInt(_totalHandsPlayedStorageKey, _totalHandsPlayed);
-      await prefs.setInt(_totalHandsWonStorageKey, _totalHandsWon);
-      await prefs.setInt(_bestScoreStorageKey, _bestScore);
-      await prefs.setInt(
-        _totalPenaltyStorageKey,
-        _totalPenaltyPointsReceived,
-      );
-      await prefs.setInt(_highestScoreStorageKey, _highestScoreReached);
-    } catch (_) {
-      // Statistics persistence must never interrupt gameplay.
-    }
-  }
-
-  void _recordCompletedGame({required int reached100Index}) {
-    if (_currentGameStatsRecorded || !_gameStatsLoaded || players.isEmpty) {
-      return;
-    }
-
-    _currentGameStatsRecorded = true;
-
-    final int finalHumanScore = players[0].score;
-    final int lowestScore = players
-        .map((player) => player.score)
-        .reduce(min);
-    final bool humanWon = finalHumanScore == lowestScore;
-
-    _gamesPlayed++;
-    if (humanWon) {
-      _gamesWon++;
-    } else {
-      _gamesLost++;
-    }
-
-    // The game ends after the current Hand is scored, so handNumber is the
-    // number of Hands actually completed in this game.
-    _totalHandsPlayed += handNumber;
-    _totalHandsWon += players[0].handsWon;
-
-    if (_bestScore < 0 || finalHumanScore < _bestScore) {
-      _bestScore = finalHumanScore;
-    }
-
-    // Every penalty point actually awarded to the human is reflected in
-    // their score during a completed game. This also respects ♠Q protection.
-    _totalPenaltyPointsReceived += players[0].score;
-
-    if (finalHumanScore > _highestScoreReached) {
-      _highestScoreReached = finalHumanScore;
-    }
-
-    _saveGameStatistics();
-  }
-
-  Future<void> _showUserDetails() async {
-    if (!_gameStatsLoaded) return;
-
-    final double winRate = _gamesPlayed == 0
-        ? 0.0
-        : (_gamesWon / _gamesPlayed) * 100.0;
-
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          title: const Text(
-            'USER DETAILS',
-            textAlign: TextAlign.center,
-            style: TextStyle(fontWeight: FontWeight.w800),
-          ),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  _playerAvatars[_selectedAvatarIndex]['emoji'] ?? '👤',
-                  style: const TextStyle(fontSize: 58),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  _playerName.isEmpty ? 'YOU' : _playerName,
-                  style: const TextStyle(
-                    fontSize: 21,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-                const SizedBox(height: 16),
-                _statRow('Games Played', '$_gamesPlayed'),
-                _statRow('Games Won', '$_gamesWon'),
-                _statRow('Games Lost', '$_gamesLost'),
-                _statRow('Win Percentage', '${winRate.toStringAsFixed(1)}%'),
-                _statRow('Total Hands Played', '$_totalHandsPlayed'),
-                _statRow('Total Hands Won', '$_totalHandsWon'),
-                _statRow(
-                  'Best Score',
-                  _bestScore < 0 ? '—' : '$_bestScore',
-                ),
-                _statRow(
-                  'Penalty Points Received',
-                  '$_totalPenaltyPointsReceived',
-                ),
-                _statRow('Highest Score Reached', '$_highestScoreReached'),
-              ],
-            ),
-          ),
-          actions: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                TextButton.icon(
-                  onPressed: () {
-                    Navigator.pop(dialogContext);
-                    Future.delayed(
-                      const Duration(milliseconds: 120),
-                      _editPlayerProfile,
-                    );
-                  },
-                  icon: const Icon(Icons.edit_rounded, size: 18),
-                  label: const Text('EDIT PROFILE'),
-                ),
-                const SizedBox(width: 8),
-                TextButton(
-                  onPressed: () => Navigator.pop(dialogContext),
-                  child: const Text('CLOSE'),
-                ),
-              ],
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  Future<void> _editPlayerProfile() async {
-    _profileNameController.text = _playerName;
-    int editingAvatarIndex = _selectedAvatarIndex;
-
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            return AlertDialog(
-              title: const Text(
-                'EDIT PROFILE',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontWeight: FontWeight.w800),
-              ),
-              content: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    TextField(
-                      controller: _profileNameController,
-                      textCapitalization: TextCapitalization.words,
-                      maxLength: 20,
-                      decoration: const InputDecoration(
-                        labelText: 'PLAYER NAME',
-                        hintText: 'Enter your name',
-                        prefixIcon: Icon(Icons.person_outline),
-                        counterText: '',
-                      ),
-                    ),
-                    const SizedBox(height: 18),
-                    const Text(
-                      'CHOOSE YOUR CHARACTER',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 1.5,
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    Wrap(
-                      alignment: WrapAlignment.center,
-                      spacing: 8,
-                      runSpacing: 9,
-                      children: List<Widget>.generate(
-                        _playerAvatars.length,
-                        (index) {
-                          final avatar = _playerAvatars[index];
-                          final bool selected = editingAvatarIndex == index;
-                          return GestureDetector(
-                            onTap: () {
-                              setDialogState(() {
-                                editingAvatarIndex = index;
-                              });
-                            },
-                            child: AnimatedContainer(
-                              duration: const Duration(milliseconds: 160),
-                              width: 82,
-                              height: 100,
-                              decoration: BoxDecoration(
-                                color: selected
-                                    ? const Color(0xfffff7df)
-                                    : Theme.of(context).colorScheme.surface,
-                                borderRadius: BorderRadius.circular(14),
-                                border: Border.all(
-                                  color: selected
-                                      ? const Color(0xffb58b2a)
-                                      : Theme.of(context).dividerColor,
-                                  width: selected ? 2 : 1,
-                                ),
-                              ),
-                              child: Column(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Text(
-                                    avatar['emoji']!,
-                                    style: const TextStyle(fontSize: 40),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    avatar['name']!,
-                                    style: const TextStyle(
-                                      fontSize: 9,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(dialogContext),
-                  child: const Text('CANCEL'),
-                ),
-                FilledButton(
-                  onPressed: () {
-                    final String name = _profileNameController.text.trim();
-                    if (name.isEmpty) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('Please enter your name.')),
-                      );
-                      return;
-                    }
-                    setState(() {
-                      _playerName = name;
-                      _selectedAvatarIndex = editingAvatarIndex;
-                      profileCreated = true;
-                    });
-                    _savePlayerProfile();
-                    Navigator.pop(dialogContext);
-                  },
-                  child: const Text('SAVE'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-  }
-
-  Widget _statRow(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 5),
-      child: Row(
-        children: [
-          Expanded(
-            child: Text(
-              label,
-              style: const TextStyle(fontSize: 14),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Text(
-            value,
-            style: const TextStyle(
-              fontWeight: FontWeight.w700,
-              fontSize: 14,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  @override
-  void dispose() {
-    _profileNameController.dispose();
-    super.dispose();
-  }
-
-  // ==========================================================
-  // PLAYER PROFILE — STEP B
-  // Persistent profile storage.
-  // ==========================================================
-
-  Future<void> _loadPlayerProfile() async {
-    try {
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-      final bool created = prefs.getBool(_profileCreatedStorageKey) ?? false;
-      final String savedName = prefs.getString(_profileNameStorageKey) ?? '';
-      final int savedAvatar = prefs.getInt(_profileAvatarStorageKey) ?? 0;
-
-      if (!mounted) return;
-      setState(() {
-        if (created && savedName.trim().isNotEmpty) {
-          profileCreated = true;
-          _playerName = savedName.trim();
-          _selectedAvatarIndex = savedAvatar.clamp(0, _playerAvatars.length - 1).toInt();
-        }
-        _profileLoaded = true;
-      });
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _profileLoaded = true;
-      });
-    }
-  }
-
-  Future<void> _savePlayerProfile() async {
-    try {
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_profileCreatedStorageKey, true);
-      await prefs.setString(_profileNameStorageKey, _playerName);
-      await prefs.setInt(_profileAvatarStorageKey, _selectedAvatarIndex);
-    } catch (_) {
-      // Profile persistence must never prevent BREY from starting or playing.
-    }
-  }
-
-  void _createPlayerProfile() {
-    final String name = _profileNameController.text.trim();
-    if (name.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please enter your name.')),
-      );
-      return;
-    }
-
-    setState(() {
-      _playerName = name;
-      profileCreated = true;
-    });
-    _savePlayerProfile();
-  }
-
-  Widget _profileAvatarCard(int index) {
-    final avatar = _playerAvatars[index];
-    final bool selected = _selectedAvatarIndex == index;
-
-    return GestureDetector(
-      onTap: () {
-        setState(() {
-          _selectedAvatarIndex = index;
-        });
-      },
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 180),
-        width: 92,
-        height: 112,
-        decoration: BoxDecoration(
-          color: selected
-              ? const Color(0xfffff7df)
-              : Colors.white.withValues(alpha: 0.72),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(
-            color: selected
-                ? const Color(0xffb58b2a)
-                : const Color(0xffd5c9b0),
-            width: selected ? 2.2 : 1,
-          ),
-          boxShadow: selected
-              ? [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.13),
-                    blurRadius: 8,
-                    offset: const Offset(0, 3),
-                  ),
-                ]
-              : const [],
-        ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            AnimatedScale(
-              scale: selected ? 1.08 : 1.0,
-              duration: const Duration(milliseconds: 180),
-              child: Text(
-                avatar['emoji']!,
-                style: const TextStyle(fontSize: 47),
-              ),
-            ),
-            const SizedBox(height: 5),
-            Text(
-              avatar['name']!,
-              style: TextStyle(
-                fontSize: 10,
-                fontWeight: FontWeight.w700,
-                color: selected
-                    ? const Color(0xff6e5118)
-                    : const Color(0xff665a48),
-              ),
-            ),
-            const SizedBox(height: 2),
-            Text(
-              avatar['gender']!,
-              style: const TextStyle(
-                fontSize: 8,
-                color: Color(0xff8b7b62),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildPlayerProfileSetup() {
-    return Scaffold(
-      body: SafeArea(
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final bool compact = constraints.maxHeight < 680;
-            return Container(
-              width: double.infinity,
-              height: double.infinity,
-              color: const Color(0xfff3ead7),
-              child: SingleChildScrollView(
-                padding: EdgeInsets.symmetric(
-                  horizontal: constraints.maxWidth > 520 ? 40 : 22,
-                  vertical: compact ? 16 : 28,
-                ),
-                child: Center(
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 560),
-                    child: Column(
-                      children: [
-                        const Text(
-                          'WELCOME TO BREY',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            fontSize: 29,
-                            fontWeight: FontWeight.w400,
-                            letterSpacing: 3.2,
-                            color: Color(0xff17130d),
-                          ),
-                        ),
-                        const SizedBox(height: 7),
-                        const Text(
-                          'CREATE YOUR PLAYER PROFILE',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                            letterSpacing: 1.7,
-                            color: Color(0xff6b5a40),
-                          ),
-                        ),
-                        const SizedBox(height: 22),
-                        TextField(
-                          controller: _profileNameController,
-                          textCapitalization: TextCapitalization.words,
-                          maxLength: 20,
-                          decoration: InputDecoration(
-                            labelText: 'PLAYER NAME',
-                            hintText: 'Enter your name',
-                            filled: true,
-                            fillColor: Colors.white.withValues(alpha: 0.78),
-                            counterText: '',
-                            prefixIcon: const Icon(Icons.person_outline),
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(12),
-                              borderSide: const BorderSide(
-                                color: Color(0xffc9b996),
-                              ),
-                            ),
-                            enabledBorder: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(12),
-                              borderSide: const BorderSide(
-                                color: Color(0xffc9b996),
-                              ),
-                            ),
-                            focusedBorder: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(12),
-                              borderSide: const BorderSide(
-                                color: Color(0xffa47b24),
-                                width: 1.5,
-                              ),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(height: 19),
-                        const Text(
-                          'CHOOSE YOUR CHARACTER',
-                          style: TextStyle(
-                            fontSize: 11.5,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: 1.7,
-                            color: Color(0xff5f513b),
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                        Wrap(
-                          alignment: WrapAlignment.center,
-                          spacing: 9,
-                          runSpacing: 10,
-                          children: List<Widget>.generate(
-                            _playerAvatars.length,
-                            _profileAvatarCard,
-                          ),
-                        ),
-                        const SizedBox(height: 23),
-                        SizedBox(
-                          width: 330,
-                          height: 54,
-                          child: ElevatedButton.icon(
-                            onPressed: _createPlayerProfile,
-                            icon: const Icon(Icons.check_circle_outline),
-                            label: const Text(
-                              'CREATE PROFILE',
-                              style: TextStyle(
-                                fontSize: 15,
-                                fontWeight: FontWeight.w700,
-                                letterSpacing: 1.0,
-                              ),
-                            ),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xff17130d),
-                              foregroundColor: const Color(0xfffff8e8),
-                              elevation: 4,
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(8),
-                                side: const BorderSide(
-                                  color: Color(0xffc29a45),
-                                  width: 1.2,
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        const Text(
-                          'You can change your profile later.',
-                          style: TextStyle(
-                            fontSize: 10,
-                            color: Color(0xff817258),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            );
-          },
-        ),
-      ),
-    );
-  }
-
-  // ==========================================================
-  // VIBRATION FEEDBACK — V1.18
-  // ==========================================================
-
-  Future<void> _playFeedback({
-    bool vibrate = true,
-    bool strongVibration = false,
-  }) async {
-    if (!_vibrationEnabled || !vibrate) return;
-    try {
-      if (strongVibration) {
-        await HapticFeedback.heavyImpact();
-      } else {
-        await HapticFeedback.lightImpact();
-      }
-    } catch (_) {}
-  }
-
-  Future<void> _playIllegalMoveFeedback() async {
-    await _playFeedback();
-  }
-
-  Future<void> _loadSettings() async {
-    try {
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-      if (!mounted) return;
-      setState(() {
-        _vibrationEnabled = prefs.getBool(_settingsVibrationKey) ?? true;
-        _appearanceMode = prefs.getString(_settingsAppearanceKey) ?? 'system';
-        if (!_appearanceOptions.contains(_appearanceMode)) _appearanceMode = 'system';
-        _cardAnimationEnabled = prefs.getBool(_settingsCardAnimationKey) ?? true;
-        _animationSpeed = prefs.getString(_settingsAnimationSpeedKey) ?? 'normal';
-        if (!_animationSpeedOptions.contains(_animationSpeed)) _animationSpeed = 'normal';
-        _autoNextHand = prefs.getBool(_settingsAutoNextHandKey) ?? true;
-        _beginnerHintsEnabled = prefs.getBool(_settingsHintsKey) ?? true;
-        _ruleRemindersEnabled = prefs.getBool(_settingsRuleRemindersKey) ?? true;
-        _keepScreenAwake = prefs.getBool(_settingsKeepAwakeKey) ?? true;
-        _settingsLoaded = true;
-      });
-     } catch (_) {
-      _settingsLoaded = true;
-    }
-  }
-
-  static const List<String> _appearanceOptions = <String>[
-    'system',
-    'light',
-    'dark',
-  ];
-
-  static const List<String> _animationSpeedOptions = <String>[
-    'normal',
-    'fast',
-  ];
-
-  Future<void> _saveSettings() async {
-    if (!_settingsLoaded) return;
-    try {
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_settingsVibrationKey, _vibrationEnabled);
-      await prefs.setString(_settingsAppearanceKey, _appearanceMode);
-      await prefs.setBool(_settingsCardAnimationKey, _cardAnimationEnabled);
-      await prefs.setString(_settingsAnimationSpeedKey, _animationSpeed);
-      await prefs.setBool(_settingsAutoNextHandKey, _autoNextHand);
-      await prefs.setBool(_settingsHintsKey, _beginnerHintsEnabled);
-      await prefs.setBool(_settingsRuleRemindersKey, _ruleRemindersEnabled);
-      await prefs.setBool(_settingsKeepAwakeKey, _keepScreenAwake);
-    } catch (_) {
-      // Settings are convenience preferences; gameplay must continue.
-    }
-  }
-
-  String _appearanceLabel(String value) {
-    switch (value) {
-      case 'light':
-        return 'Light Mode';
-      case 'dark':
-        return 'Dark Mode';
-      default:
-        return 'System Default';
-    }
-  }
-
-  Future<void> _showSettings() async {
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            void update(VoidCallback change) {
-              setDialogState(change);
-              setState(change);
-              if (_appearanceMode.isNotEmpty) {
-                widget.onAppearanceChanged?.call(_appearanceMode);
-              }
-                       _saveSettings();
-            }
-
-            return AlertDialog(
-              title: const Row(
-                children: [
-                  Icon(Icons.settings_rounded),
-                  SizedBox(width: 10),
-                  Text('SETTINGS'),
-                ],
-              ),
-              content: SizedBox(
-                width: 520,
-                child: SingleChildScrollView(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      _settingsSectionTitle('VIBRATION'),
-                      SwitchListTile.adaptive(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Vibration'),
-                        subtitle: const Text('Touch and game feedback'),
-                        value: _vibrationEnabled,
-                        onChanged: (value) => update(() => _vibrationEnabled = value),
-                      ),
-                      const Divider(),
-                      _settingsSectionTitle('APPEARANCE'),
-                      DropdownButtonFormField<String>(
-                        value: _appearanceMode,
-                        decoration: const InputDecoration(
-                          labelText: 'Theme',
-                          border: OutlineInputBorder(),
-                        ),
-                        items: _appearanceOptions.map((value) {
-                          return DropdownMenuItem<String>(
-                            value: value,
-                            child: Text(_appearanceLabel(value)),
-                          );
-                        }).toList(),
-                        onChanged: (value) {
-                          if (value == null) return;
-                          update(() => _appearanceMode = value);
-                        },
-                      ),
-                      const SizedBox(height: 12),
-                      const Divider(),
-                      _settingsSectionTitle('GAMEPLAY CONVENIENCE'),
-                      SwitchListTile.adaptive(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Card Animation'),
-                        value: _cardAnimationEnabled,
-                        onChanged: (value) => update(() => _cardAnimationEnabled = value),
-                      ),
-                      ListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Animation Speed'),
-                        trailing: SegmentedButton<String>(
-                          segments: const [
-                            ButtonSegment<String>(value: 'normal', label: Text('Normal')),
-                            ButtonSegment<String>(value: 'fast', label: Text('Fast')),
-                          ],
-                          selected: <String>{_animationSpeed},
-                          onSelectionChanged: (selection) {
-                            if (selection.isEmpty) return;
-                            update(() => _animationSpeed = selection.first);
-                          },
-                        ),
-                      ),
-                      SwitchListTile.adaptive(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Auto Next Hand'),
-                        value: _autoNextHand,
-                        onChanged: (value) => update(() => _autoNextHand = value),
-                      ),
-                      const Divider(),
-                      _settingsSectionTitle('ASSISTANCE'),
-                      SwitchListTile.adaptive(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Beginner Hints'),
-                        value: _beginnerHintsEnabled,
-                        onChanged: (value) => update(() => _beginnerHintsEnabled = value),
-                      ),
-                      SwitchListTile.adaptive(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Rule Reminders'),
-                        value: _ruleRemindersEnabled,
-                        onChanged: (value) => update(() => _ruleRemindersEnabled = value),
-                      ),
-                      const Divider(),
-                      _settingsSectionTitle('OTHER'),
-                      SwitchListTile.adaptive(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Keep Screen Awake'),
-                        subtitle: const Text('Saved preference; device-level screen wake is handled separately.'),
-                        value: _keepScreenAwake,
-                        onChanged: (value) => update(() => _keepScreenAwake = value),
-                      ),
-                      ListTile(
-                        contentPadding: EdgeInsets.zero,
-                        leading: const Icon(Icons.menu_book_rounded),
-                        title: const Text('Rule Book'),
-                        trailing: const Icon(Icons.chevron_right_rounded),
-                        onTap: () {
-                          Navigator.pop(dialogContext);
-                          showRuleBook();
-                        },
-                      ),
-                      ListTile(
-                        contentPadding: EdgeInsets.zero,
-                        leading: const Icon(Icons.info_outline_rounded),
-                        title: const Text('About BREY'),
-                        trailing: const Icon(Icons.chevron_right_rounded),
-                        onTap: () {
-                          showDialog<void>(
-                            context: context,
-                            builder: (aboutContext) => AlertDialog(
-                              title: const Text('ABOUT BREY'),
-                              content: const Text(
-                                'BREY is a classic game of cards, risk & strategy.\n\n'
-                                'Settings are saved on this device for convenience.',
-                              ),
-                              actions: [
-                                TextButton(
-                                  onPressed: () => Navigator.pop(aboutContext),
-                                  child: const Text('CLOSE'),
-                                ),
-                              ],
-                            ),
-                          );
-                        },
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(dialogContext),
-                  child: const Text('CLOSE'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-  }
-
-  Widget _settingsSectionTitle(String title) {
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Padding(
-        padding: const EdgeInsets.only(top: 4, bottom: 4),
-        child: Text(
-          title,
-          style: const TextStyle(
-            fontSize: 11,
-            fontWeight: FontWeight.w700,
-            letterSpacing: 1.5,
-            color: Color(0xff8a6a2b),
-          ),
-        ),
-      ),
-    );
   }
 
   // BUILD
@@ -8759,18 +7399,6 @@ CardModel chooseBotCard(
     // ========================================================
     // START SCREEN
     // ========================================================
-
-    if (!_profileLoaded) {
-      return const Scaffold(
-        body: Center(
-          child: CircularProgressIndicator(),
-        ),
-      );
-    }
-
-    if (!profileCreated) {
-      return _buildPlayerProfileSetup();
-    }
 
     if (!gameStarted) {
       return Scaffold(
@@ -8893,7 +7521,7 @@ CardModel chooseBotCard(
                         width: w > 420 ? 340 : double.infinity,
                         height: 58,
                         child: ElevatedButton.icon(
-                          onPressed: _requestNewGame,
+                          onPressed: startNewGame,
                           icon: const Icon(Icons.play_arrow_rounded),
                           label: const Text(
                             'START NEW GAME',
@@ -8920,64 +7548,6 @@ CardModel chooseBotCard(
                       ),
 
                       const SizedBox(height: 12),
-
-                      SizedBox(
-                        width: w > 420 ? 340 : double.infinity,
-                        height: 50,
-                        child: OutlinedButton.icon(
-                          onPressed: _showUserDetails,
-                          icon: const Icon(Icons.person_rounded, size: 19),
-                          label: const Text(
-                            'USER DETAILS',
-                            style: TextStyle(
-                              fontSize: 14.5,
-                              fontWeight: FontWeight.w600,
-                              letterSpacing: 1.3,
-                            ),
-                          ),
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: const Color(0xff17130d),
-                            side: const BorderSide(
-                              color: Color(0xffa47b24),
-                              width: 1.2,
-                            ),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(7),
-                            ),
-                          ),
-                        ),
-                      ),
-
-                      const SizedBox(height: 8),
-
-                      SizedBox(
-                        width: w > 420 ? 340 : double.infinity,
-                        height: 50,
-                        child: OutlinedButton.icon(
-                          onPressed: _showSettings,
-                          icon: const Icon(Icons.settings_rounded, size: 19),
-                          label: const Text(
-                            'SETTINGS',
-                            style: TextStyle(
-                              fontSize: 14.5,
-                              fontWeight: FontWeight.w600,
-                              letterSpacing: 1.3,
-                            ),
-                          ),
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: const Color(0xff17130d),
-                            side: const BorderSide(
-                              color: Color(0xffa47b24),
-                              width: 1.2,
-                            ),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(7),
-                            ),
-                          ),
-                        ),
-                      ),
-
-                      const SizedBox(height: 8),
 
                       SizedBox(
                         width: w > 420 ? 340 : double.infinity,
@@ -9053,6 +7623,22 @@ CardModel chooseBotCard(
               // SECTION 2 — PLAY AREA
               // =================================================
 
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: Text(
+                    message,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 10),
+
               if (dealingPhase)
                 Center(
                   child: ConstrainedBox(
@@ -9070,19 +7656,6 @@ CardModel chooseBotCard(
                   !exchangePhase &&
                   !roundFinished) ...[
                 buildCurrentHand(),
-
-                if (handCollecting &&
-                    !_autoNextHand &&
-                    !gameOver &&
-                    !roundFinished &&
-                    collectingWinnerIndex != null) ...[
-                  const SizedBox(height: 8),
-                  ElevatedButton.icon(
-                    onPressed: () => startNextHand(collectingWinnerIndex!),
-                    icon: const Icon(Icons.arrow_forward_rounded),
-                    label: Text('CONTINUE TO HAND ${handNumber + 1}'),
-                  ),
-                ],
 
                 const SizedBox(height: 10),
 
@@ -9169,7 +7742,7 @@ CardModel chooseBotCard(
                 ),
               ],
 
-              if (roundFinished && !gameOver)
+              if (roundFinished)
                 buildRoundResultPanel(),
 
               const SizedBox(height: 20),
