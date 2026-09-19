@@ -2452,6 +2452,7 @@ class _BreyGameState extends State<BreyGame> {
         gameOver ||
         dealingPhase ||
         handCollecting ||
+        _handResolving ||
         currentHand.length >= 4) {
       return;
     }
@@ -2500,7 +2501,7 @@ class _BreyGameState extends State<BreyGame> {
   ) {
     // Absolute state guard: once four cards are on the table, the Hand is
     // complete and no fifth card may ever be removed from any player's hand.
-    if (currentHand.length >= 4) {
+    if (currentHand.length >= 4 || handCollecting || _handResolving) {
       return;
     }
 
@@ -2654,6 +2655,10 @@ class _BreyGameState extends State<BreyGame> {
 
     if (exchangePhase ||
         roundFinished ||
+        gameOver ||
+        dealingPhase ||
+        handCollecting ||
+        _handResolving ||
         currentHand.length >= 4) {
       return;
     }
@@ -7653,6 +7658,13 @@ CardModel chooseBotCard(
 
     if (!mounted) return;
 
+    // Only the same completed Hand that entered the resolution phase may
+    // clear the table. A stale callback must never remove cards from a new Hand.
+    if (currentHand.length != 4) {
+      _handResolving = false;
+      return;
+    }
+
     setState(() {
       handCollecting = false;
       collectingWinnerIndex = null;
@@ -7756,14 +7768,10 @@ CardModel chooseBotCard(
     });
 
     if (currentPlayerIndex != 0) {
-      Future.delayed(
-        const Duration(milliseconds: 500),
-        () {
-          if (mounted) {
-            playBotTurn();
-          }
-        },
-      );
+      // Start the next BOT turn only after the previous Hand has completely
+      // finished.  The generation guard prevents an old delayed callback
+      // from playing into the new Hand.
+      _scheduleBotTurn(const Duration(milliseconds: 500));
     }
   }
 
