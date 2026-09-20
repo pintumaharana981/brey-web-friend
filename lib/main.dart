@@ -2940,8 +2940,19 @@ class _BreyGameState extends State<BreyGame> {
           return;
         }
 
-        if (currentPlayerIndex != 0) {
-          _scheduleBotTurn();
+        // Schedule the next BOT only from the state that actually exists
+        // after this successful play. This is intentionally based on the
+        // authoritative currentPlayerIndex, not the old expectedPlayer.
+        // It prevents a valid BOT move from leaving the next BOT turn
+        // unscheduled after a rapid state transition.
+        if (currentHand.length < 4 &&
+            !_handResolving &&
+            !_handTransitionDelay &&
+            !handCollecting &&
+            currentPlayerIndex != 0 &&
+            !roundFinished &&
+            !gameOver) {
+          _scheduleBotTurn(delayMs: 720);
         }
       } catch (error, stack) {
         // A defensive catch is essential: an exception inside a delayed
@@ -2974,17 +2985,28 @@ class _BreyGameState extends State<BreyGame> {
 
     final int retryDelay = _botRecoveryAttempts <= 2 ? 120 : 250;
 
+    // Mark the recovery callback as the pending BOT turn immediately. This
+    // closes a small race where another state callback could observe no
+    // scheduled BOT and start a second recovery chain.
+    _botTurnScheduled = true;
+
     Future.delayed(Duration(milliseconds: retryDelay), () {
+      _botTurnScheduled = false;
+
       if (!mounted || token != _botTurnGeneration) return;
       if (currentPlayerIndex == 0 ||
           currentHand.length >= 4 ||
           roundFinished ||
-          gameOver) {
+          gameOver ||
+          handCollecting ||
+          _handResolving ||
+          _handTransitionDelay) {
+        // If this was only a temporary transition, the normal transition
+        // completion will schedule the next BOT turn.
         return;
       }
 
-      if (_botTurnScheduled) return;
-      _scheduleBotTurn(delayMs: retryDelay);
+      _scheduleBotTurn(delayMs: 0);
     });
   }
 
@@ -3662,7 +3684,7 @@ class _BreyGameState extends State<BreyGame> {
       case BotDifficulty.medium:
         return 2.40;
       case BotDifficulty.hard:
-        return 3.00;
+        return 5.50;
     }
   }
 
@@ -4342,6 +4364,64 @@ class _BreyGameState extends State<BreyGame> {
     return score.clamp(0.0, 1800.0).toDouble();
   }
 
+  // HARD MODE — MAXIMUM HUMAN PRESSURE
+  //
+  // Hard mode does not cheat and does not bypass BREY legality. It simply
+  // gives the existing strategic engines a much stronger human-targeting
+  // priority. This keeps card counting, void attacks, penalty transfer,
+  // Queen attacks, self-preservation and look-ahead intact while making the
+  // Hard bots extremely difficult to beat.
+  double scoreHardHumanLock(
+    int botIndex,
+    CardModel candidate, {
+    required bool leading,
+    required bool winning,
+  }) {
+    if (botDifficulty != BotDifficulty.hard || botIndex == 0) return 0.0;
+
+    const int humanIndex = 0;
+    final int humanScore = players[humanIndex].score;
+    final int currentWinner = determineCurrentWinner();
+    final double handPenalty = currentHandPenaltyTotal();
+    final bool humanVoid =
+        voidSuitsByPlayer[humanIndex].contains(candidate.suit);
+
+    double score = 0.0;
+
+    // Hard mode strongly prefers legal plays that attack a publicly known
+    // human void. This is especially valuable when the suit carries penalty.
+    if (leading && humanVoid) {
+      score += 1800.0;
+      score += knownOpponentPenaltyInSuit(candidate.suit, humanIndex) * 180.0;
+    }
+
+    // If the human is currently winning a loaded Hand, make every legal
+    // non-winning opportunity to keep the Hand on the human extremely valuable.
+    if (!leading && currentWinner == humanIndex && handPenalty > 0 && !winning) {
+      score += 2600.0 + handPenalty * 220.0;
+      if (candidate.penalty > 0) {
+        score += candidate.penalty * 260.0;
+      }
+    }
+
+    // When the human has a high cumulative score, concentrate even more on
+    // transferring visible penalties to them rather than taking them ourselves.
+    if (humanScore >= 60) {
+      score += handPenalty * 45.0;
+      if (candidate.penalty > 0 && currentWinner == humanIndex && !winning) {
+        score += candidate.penalty * 180.0;
+      }
+    }
+
+    // Never force a BOT to take a loaded Hand merely for aggression. The
+    // existing strategic/self-preservation layers remain authoritative.
+    if (winning && candidate.penalty > 0) {
+      score -= candidate.penalty * 110.0;
+    }
+
+    return score.clamp(-1200.0, 6500.0).toDouble();
+  }
+
   double scoreAttack200Percent(
     int botIndex,
     CardModel candidate, {
@@ -4349,6 +4429,15 @@ class _BreyGameState extends State<BreyGame> {
     required bool winning,
   }) {
     double score = 0;
+
+    // HARD MODE human-lock layer is added first so the existing strategy
+    // engines remain active underneath it rather than being replaced.
+    score += scoreHardHumanLock(
+      botIndex,
+      candidate,
+      leading: leading,
+      winning: winning,
+    );
 
     // PRIMARY TARGET — human player (index 0).
     // This is intentionally stronger than generic opponent pressure.
