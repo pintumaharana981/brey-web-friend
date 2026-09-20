@@ -357,7 +357,6 @@ class _BreyGameState extends State<BreyGame> {
   int _botTurnGeneration = 0;
   bool _botTurnScheduled = false;
   int _botRecoveryAttempts = 0;
-  
 
   // Selected BOT difficulty. The UI intentionally shows only the
   // difficulty names; the strength calibration is kept internal.
@@ -10495,7 +10494,7 @@ CardModel chooseBotCard(
             color: good ? const Color(0xff2e7d32) : const Color(0xffb3261e),
           ),
           const SizedBox(width: 4),
-          Text(
+          _coloredSuitText(
             text,
             style: TextStyle(
               fontSize: 10.5,
@@ -10556,7 +10555,7 @@ CardModel chooseBotCard(
               Icon(icon, size: 19, color: const Color(0xff165b43)),
               const SizedBox(width: 6),
               Expanded(
-                child: Text(
+                child: _coloredSuitText(
                   title,
                   style: const TextStyle(
                     fontSize: 15,
