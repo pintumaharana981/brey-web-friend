@@ -323,6 +323,16 @@ class _BreyGameState extends State<BreyGame> {
   // A delayed BOT callback and the final card animation can otherwise race
   // around the fourth card and consume the next Hand's state.
   bool _handResolving = false;
+  // Hard one-second lock between completed-Hand processing and the next Hand.
+  bool _handTransitionDelay = false;
+
+  // Single authoritative BOT runner. There must never be multiple delayed BOT
+  // callbacks competing to play the same Hand.
+
+  // Exactly one card from each of the four players must be played before
+  // any Hand calculation is allowed to begin. This is the authoritative
+  // per-Hand turn ledger and also blocks duplicate/stale BOT callbacks.
+  final Set<int> _playersPlayedThisHand = <int>{};
 
   // Total penalty points collected by each player during the CURRENT Round.
   // This is used for the Round-level 35-point rule.
@@ -345,6 +355,9 @@ class _BreyGameState extends State<BreyGame> {
   // Prevent delayed BOT callbacks from an old Hand from playing cards in a
   // new Hand after the previous Hand has been collected.
   int _botTurnGeneration = 0;
+  bool _botTurnScheduled = false;
+  int _botRecoveryAttempts = 0;
+  
 
   // Selected BOT difficulty. The UI intentionally shows only the
   // difficulty names; the strength calibration is kept internal.
@@ -400,17 +413,27 @@ class _BreyGameState extends State<BreyGame> {
   // AUTHORITATIVE TABLE DIRECTIONS
   // ==========================================================
   //
-  // BREY intentionally uses opposite directions:
-  //   Exchange: LEFT  -> +1
-  //   Card play: ANTICLOCKWISE -> -1
+  // BREY uses opposite directions for exchange and gameplay:
+  //   CHOOSING / EXCHANGE: RIGHT (player - 1)
+  //   CARD PLAY: LEFT (player + 1)
+  //
+  // Example when Player 0 is the dealer:
+  //   EXCHANGE: YOU -> BOT 3 -> BOT 2 -> BOT 1 -> YOU
+  //   PLAY:     BOT 1 -> BOT 2 -> BOT 3 -> YOU
   //
   // Keeping these mappings in one place prevents direction drift between
-  // dealing, exchange, card play, and bot prediction.
+  // exchange, dealing, card play, and bot prediction.
   int playerOnLeft(int playerIndex) => (playerIndex + 1) % 4;
 
   int playerOnRight(int playerIndex) => (playerIndex + 3) % 4;
 
-  int nextPlayerAnticlockwise(int playerIndex) => playerOnRight(playerIndex);
+  // Authoritative BREY directions are kept exactly as implemented in the game engine.
+  // UI wording should describe the player-visible LEFT pass and play order.
+  int nextPlayerForPlay(int playerIndex) => playerOnLeft(playerIndex);
+
+  // Legacy compatibility alias. Existing code may still call this name,
+  // and it follows the authoritative CLOCKWISE gameplay direction.
+  int nextPlayerClockwise(int playerIndex) => nextPlayerForPlay(playerIndex);
 
   // RULE 1 — VOID + ♠Q:
   // In Hands 2–13, if a player is void in the led suit and holds ♠Q,
@@ -418,17 +441,9 @@ class _BreyGameState extends State<BreyGame> {
   //
   // This method remains only because the play flow already calls it.
   // The actual legality rule is enforced authoritatively by isLegalCard().
-  void updateSpadeQueenLockAfterPlay(
-    int playerIndex,
-    CardModel playedCard,
-  ) {
-    // No lock state is created, released, or consulted by Rule 1.
-  }
-
-
-  // BREY DIRECTION RULE:
-  // Passing 4 cards: 1 -> 2 -> 3 -> 4 -> 1 (clockwise / left).
-  // Playing cards:   1 -> 4 -> 3 -> 2 -> 1 (anticlockwise / right).
+    // BREY DIRECTION RULE:
+  // Passing 4 cards: 1 -> 4 -> 3 -> 2 -> 1 (right / -1).
+  // Playing cards:   1 -> 2 -> 3 -> 4 -> 1 (left / +1).
 
 
   // ==========================================================
@@ -445,15 +460,6 @@ class _BreyGameState extends State<BreyGame> {
   // ==========================================================
 
   bool spadeQueenPlayedThisRound = false;
-
-  // ♠Q lock is private to each player. It is created only when an unlocked
-  // ♠Q is voluntarily declined while the player is void in the led suit.
-  final List<bool> spadeQueenLockedByPlayer = [
-    false,
-    false,
-    false,
-    false,
-  ];
 
   // GLOBAL lead-suit rule:
   // the consecutive lead count belongs to the whole table, not to
@@ -759,10 +765,10 @@ class _BreyGameState extends State<BreyGame> {
                             ),
                           ),
                           const SizedBox(height: 9),
-                          Text(
+                          _coloredSuitText(
                             message,
                             textAlign: TextAlign.left,
-                            style: TextStyle(
+                            style: const TextStyle(
                               fontSize: 14,
                               height: 1.35,
                               color: Colors.black87,
@@ -816,6 +822,10 @@ class _BreyGameState extends State<BreyGame> {
     // so repeating it here gives a new player help exactly when it is needed.
     if (!mounted || (!_beginnerHintsEnabled && !_ruleRemindersEnabled)) return;
 
+    // Each distinct rule hint is shown only once during the game session.
+    // Once the player has learned a rule, do not interrupt them with the
+    // same popup again; other rule situations can still show their own hint.
+    if (_shownRuleHints.contains(key)) return;
     _shownRuleHints.add(key);
 
     await _showSmoothHint(
@@ -829,8 +839,8 @@ class _BreyGameState extends State<BreyGame> {
     if (!mounted ||
         !_beginnerHintsEnabled ||
         _firstHandHintShown ||
-        roundNumber != 1 ||
-        handNumber != 1) {
+        handNumber != 1 ||
+        currentPlayerIndex != 0) {
       return;
     }
 
@@ -839,30 +849,24 @@ class _BreyGameState extends State<BreyGame> {
     await _showSmoothHint(
       title: 'FIRST HAND — EASY START',
       message:
-          'Three things to remember:\n\n'
-          '1. The first card must be a safe ♣ or ♦ card.\n'
-          '2. If someone leads a suit you have, follow that suit.\n'
+          'Three things to remember in Hand 1:\n\n'
+          '1. PLAYING goes RIGHT (CLOCKWISE): the player immediately after the dealer starts Hand 1. If YOU are the dealer: Bot 1 → Bot 2 → Bot 3 → You.\n'
+          '2. If you have a safe ♣ or ♦, you must lead one of them. If you do not, any card except ♠Q may lead.\n'
           '3. If you cannot follow suit in Hand 1, play a non-penalty card when you have one.',
       scenario: _hintFlow(
-        title: 'HAND 1 OPENING',
+        title: 'HAND 1 — DIRECTION + OPENING',
         steps: [
-          Column(
-            children: [
-              const Text('YOUR HAND', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 4),
-              Row(children: [
-                _hintCard(rank: '7', suit: 'Clubs', highlighted: true),
-                _hintCard(rank: '5', suit: 'Hearts'),
-              ]),
-            ],
-          ),
-          _hintArrow('→ PLAY'),
-          Column(
-            children: [
-              const Text('SAFE ✓', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
-              _hintCard(rank: '7', suit: 'Clubs', highlighted: true),
-            ],
-          ),
+          Column(children: [
+            const Text('PLAY', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+            const Text('BOT 1 → BOT 2 → BOT 3 → YOU', textAlign: TextAlign.center, style: TextStyle(fontSize: 9, fontWeight: FontWeight.w800)),
+            const Text("START FROM DEALER'S RIGHT", style: TextStyle(fontSize: 9)),
+          ]),
+          _hintArrow('→'),
+          Column(children: [
+            const Text('YOUR LEGAL LEAD', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+            _hintCard(rank: '7', suit: 'Clubs', highlighted: true),
+            _coloredSuitText('SAFE ♣ / ♦', style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w800), textAlign: TextAlign.center),
+          ]),
         ],
       ),
     );
@@ -871,7 +875,7 @@ class _BreyGameState extends State<BreyGame> {
   // ==========================================================
   // V1.3.24 - FINAL COMPILE FIX: directions, Q legality, round-end flow, privacy, and rulebook
 // No gameplay behavior is changed in this audit build.
-// V42.56 STABILITY BASELINE CHECKS
+// V42.56 STABILITY BASELINE CHECKS — REVERSED DIRECTION
   // ==========================================================
 
   void _runDirectionIntegrityChecks() {
@@ -881,10 +885,10 @@ class _BreyGameState extends State<BreyGame> {
     assert(playerOnLeft(2) == 3);
     assert(playerOnLeft(3) == 0);
 
-    assert(nextPlayerAnticlockwise(0) == 3);
-    assert(nextPlayerAnticlockwise(3) == 2);
-    assert(nextPlayerAnticlockwise(2) == 1);
-    assert(nextPlayerAnticlockwise(1) == 0);
+    assert(nextPlayerForPlay(0) == 1);
+    assert(nextPlayerForPlay(1) == 2);
+    assert(nextPlayerForPlay(2) == 3);
+    assert(nextPlayerForPlay(3) == 0);
 
 
     assert(playerOnLeft(0) == 1);
@@ -897,10 +901,46 @@ class _BreyGameState extends State<BreyGame> {
     assert(playerOnRight(2) == 1);
     assert(playerOnRight(1) == 0);
 
-    assert(nextPlayerAnticlockwise(0) == 3);
-    assert(nextPlayerAnticlockwise(3) == 2);
-    assert(nextPlayerAnticlockwise(2) == 1);
-    assert(nextPlayerAnticlockwise(1) == 0);
+    assert(nextPlayerForPlay(0) == 1);
+    assert(nextPlayerForPlay(1) == 2);
+    assert(nextPlayerForPlay(2) == 3);
+    assert(nextPlayerForPlay(3) == 0);
+  }
+
+  // Verifies that no card has been lost or duplicated during gameplay.
+  // This is intentionally read-only: it never changes game state.
+  void _verifyCardConservation(String context) {
+    final Set<String> seen = <String>{};
+    int totalCards = 0;
+
+    for (final Player player in players) {
+      totalCards += player.cards.length;
+      for (final CardModel card in player.cards) {
+        final String key = cardKey(card);
+        if (!seen.add(key)) {
+          debugPrint('BREY CARD ERROR [$context]: duplicate card $key');
+        }
+      }
+    }
+
+    // playedCardsThisRound contains both cards currently on the table and
+    // cards already collected. Therefore every physical card in the deck
+    // must appear exactly once across player hands + this list.
+    totalCards += playedCardsThisRound.length;
+
+    for (final CardModel card in playedCardsThisRound) {
+      final String key = cardKey(card);
+      if (!seen.add(key)) {
+        debugPrint('BREY CARD ERROR [$context]: duplicate played card $key');
+      }
+    }
+
+    if (totalCards != 52 || seen.length != 52) {
+      debugPrint(
+        'BREY CARD ERROR [$context]: card conservation failed. '
+        'total=$totalCards unique=${seen.length}',
+      );
+    }
   }
 
   void _runGameplayStabilityChecks() {
@@ -911,8 +951,10 @@ class _BreyGameState extends State<BreyGame> {
         assert(player.cards.length <= 13);
       }
 
-      // A Hand can contain at most four played cards.
+      // A Hand can contain at most four played cards, and the turn ledger
+      // must match the number of cards currently on the table.
       assert(currentHand.length <= 4);
+      assert(_playersPlayedThisHand.length == currentHand.length);
 
       // Turn indexes must always point to one of the four players.
       assert(currentPlayerIndex >= 0 && currentPlayerIndex < 4);
@@ -986,6 +1028,7 @@ class _BreyGameState extends State<BreyGame> {
     }
 
     currentHand.clear();
+    _playersPlayedThisHand.clear();
     ledSuit = null;
 
     roundFinished = false;
@@ -994,6 +1037,7 @@ class _BreyGameState extends State<BreyGame> {
     handCollecting = false;
     collectingWinnerIndex = null;
     _handResolving = false;
+    _handTransitionDelay = false;
     dealingPhase = false;
     dealtCardCount = 0;
     dealingStartingPlayer = 0;
@@ -1101,16 +1145,16 @@ class _BreyGameState extends State<BreyGame> {
     });
     resetVoidMemory();
 
-    // Dealer's RIGHT-side player starts.
-    int startingPlayer = playerOnRight(dealerIndex);
+    // The next player in the CLOCKWISE play direction starts Hand 1.
+    int startingPlayer = playerOnLeft(dealerIndex);
 
     int playerIndex = startingPlayer;
 
-    // Deal one card at a time anticlockwise.
+    // Deal one card at a time using the authoritative playing direction.
     for (CardModel card in deck) {
       players[playerIndex].cards.add(card);
 
-      playerIndex = nextPlayerAnticlockwise(playerIndex);
+      playerIndex = nextPlayerForPlay(playerIndex);
     }
 
     // Every player should have exactly 13.
@@ -1481,6 +1525,8 @@ class _BreyGameState extends State<BreyGame> {
   // ==========================================================
 
   void toggleExchangeCard(CardModel card) {
+    // Exchange card choosing has no popup hint. The exchange panel itself
+    // already tells the player to choose 4 cards to pass to the LEFT.
     if (!exchangePhase) {
       return;
     }
@@ -1498,29 +1544,17 @@ class _BreyGameState extends State<BreyGame> {
       selectedExchangeCards.add(card);
       unawaited(_playFeedback());
 
-      // Show the ♠Q exchange reminder immediately when ♠Q is selected
-      // by itself while another Spade is still in the player's hand.
-      if (card.isSpadeQueen &&
-          players[0].cards.where((c) => c.suit == 'Spades').length > 1 &&
-          selectedExchangeCards.where((c) => c.suit == 'Spades').length == 1 &&
-          _ruleRemindersEnabled) {
-        unawaited(
-          _showSmoothHint(
-            title: '♠Q EXCHANGE RULE',
-            message:
-                'You cannot pass ♠Q alone when you have another Spade. '
-                'Select at least one more Spade with ♠Q. '
-                'If ♠Q is your only Spade, no additional Spade is required.',
-            scenario: _hintScenario(
-              label: 'Pass ♠Q + another Spade',
-              cards: [
-                _hintCard(rank: 'Q', suit: 'Spades', highlighted: true),
-                _hintCard(rank: 'A', suit: 'Spades', highlighted: true),
-              ],
-              arrow: '✓',
-            ),
-          ),
-        );
+      // Keep the ♠Q-specific exchange popup. There is no generic
+      // choosing-card popup; this reminder appears only when ♠Q is selected.
+      if (card.isSpadeQueen) {
+        unawaited(_showRuleHintOnce(
+          key: 'spade_queen_exchange',
+          title: '♠Q EXCHANGE RULE',
+          message:
+              'If you pass ♠Q while you still have another Spade in your original hand, '
+              'you must pass at least one additional Spade with it. If ♠Q is your only Spade, '
+              'the other 3 cards may be any cards.',
+        ));
       }
     }
 
@@ -1621,9 +1655,9 @@ class _BreyGameState extends State<BreyGame> {
   // EXCHANGE AI — LEGAL 4-CARD PACKAGE ENGINE
   // ==========================================================
 
-  // BREY exchange direction is LEFT.
+  // BREY exchange direction is LEFT (ANTI-CLOCKWISE).
   // Keep the authoritative direction helper from the rule engine.
-  int exchangeTargetIndex(int botIndex) => playerOnLeft(botIndex);
+  int exchangeTargetIndex(int botIndex) => playerOnRight(botIndex);
 
   double _exchangeCardDanger(CardModel card) {
     if (card.isSpadeQueen) return 1000.0;
@@ -1947,14 +1981,14 @@ class _BreyGameState extends State<BreyGame> {
     // PASS LEFT
     //
     // Locked exchange mapping:
-    // Player 0 → Player 1
-    // Player 1 → Player 2
-    // Player 2 → Player 3
-    // Player 3 → Player 0
+    // Player 0 → Player 3
+    // Player 3 → Player 2
+    // Player 2 → Player 1
+    // Player 1 → Player 0
     // ========================================================
 
     for (int giver = 0; giver < 4; giver++) {
-      int receiver = playerOnLeft(giver);
+      int receiver = playerOnRight(giver);
 
       players[receiver].cards.addAll(
         passedCards[giver],
@@ -1966,6 +2000,7 @@ class _BreyGameState extends State<BreyGame> {
 
     // The exact exchanged cards are now known information.
     rememberOwnershipFromExchange();
+    _verifyCardConservation('exchange complete');
 
     // ========================================================
     // VERIFY 13 CARDS
@@ -1995,10 +2030,12 @@ class _BreyGameState extends State<BreyGame> {
     currentHand.clear();
     ledSuit = null;
 
-    // Dealer's right-side player starts Hand 1.
+    // The next player in the CLOCKWISE play direction starts Hand 1.
     // Any delayed BOT callback from a previous Round is now obsolete.
     _botTurnGeneration++;
-    currentPlayerIndex = playerOnRight(dealerIndex);
+    _botTurnScheduled = false;
+    _botRecoveryAttempts = 0;
+    currentPlayerIndex = playerOnLeft(dealerIndex);
 
     message =
         'Exchange complete. Hand 1 begins.';
@@ -2013,26 +2050,20 @@ class _BreyGameState extends State<BreyGame> {
       });
     }
 
-    if (roundNumber == 1 && handNumber == 1) {
+    if (handNumber == 1 && currentPlayerIndex == 0) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _showFirstHandHint();
+      });
+    } else if (currentPlayerIndex == 0) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        unawaited(_showHintForCurrentSituation());
       });
     }
 
     // If the starting player is a BOT,
     // let the BOT begin.
     if (currentPlayerIndex != 0) {
-      final int generation = _botTurnGeneration;
-      Future.delayed(const Duration(milliseconds: 500), () {
-        if (!mounted ||
-            generation != _botTurnGeneration ||
-            exchangePhase ||
-            roundFinished ||
-            currentHand.isNotEmpty) {
-          return;
-        }
-        playBotTurn();
-      });
+      _scheduleBotTurn();
     }
   }
 
@@ -2067,12 +2098,9 @@ class _BreyGameState extends State<BreyGame> {
           .toList();
     }
 
-    return player.cards.where((card) {
-      if (card.isSpadeQueen && spadeQueenLockedByPlayer[playerIndex]) {
-        return false;
-      }
-      return true;
-    }).toList();
+    // Hands 2–13: every card is a possible lead, subject only to the
+    // global two-consecutive-lead restriction checked separately.
+    return List<CardModel>.from(player.cards);
   }
 
   bool blockedSuitHasOnlyLegalLeadOptions(int playerIndex) {
@@ -2239,14 +2267,12 @@ class _BreyGameState extends State<BreyGame> {
     if (ledSuit != null) {
       final bool hasLegalLedSuit = players[playerIndex].cards.any((candidate) {
         if (candidate.suit != ledSuit) return false;
-        return !(candidate.isSpadeQueen &&
-            spadeQueenLockedByPlayer[playerIndex]);
+        return !(handNumber == 1 && candidate.isSpadeQueen);
       });
 
       if (hasLegalLedSuit &&
           (card.suit != ledSuit ||
-              (card.isSpadeQueen &&
-                  spadeQueenLockedByPlayer[playerIndex]))) {
+              (handNumber == 1 && card.isSpadeQueen))) {
         return 'You must follow the led suit with a legal card.';
       }
 
@@ -2263,15 +2289,143 @@ class _BreyGameState extends State<BreyGame> {
         }
       }
 
-      if (!hasLegalLedSuit &&
-          card.isSpadeQueen &&
-          spadeQueenLockedByPlayer[playerIndex] &&
-          players[playerIndex].cards.any((c) => !c.isSpadeQueen)) {
-        return 'When you are void in the led suit in Hands 2–13 and hold ♠Q, ♠Q must be played.';
-      }
     }
 
     return 'That card cannot be played now.';
+  }
+
+  // Proactive teaching hint: whenever the human player becomes the
+  // active player and a special rule determines what is legal, explain the
+  // situation before they have to make an illegal attempt. Gameplay state is
+  // never changed by this helper.
+  Future<void> _showHintForCurrentSituation() async {
+    if (!mounted ||
+        !_beginnerHintsEnabled ||
+        currentPlayerIndex != 0 ||
+        exchangePhase ||
+        roundFinished ||
+        gameOver ||
+        currentHand.length >= 4) {
+      return;
+    }
+
+    // Hand 1 opening lead.
+    if (handNumber == 1 && currentHand.isEmpty) {
+      await _showRuleHintOnce(
+        key: 'proactive_first_lead',
+        title: 'HAND 1 — WHAT CAN I PLAY?',
+        message:
+            'You are leading Hand 1. Play a non-penalty ♣ or ♦ when available. '
+            'If none is available, any card except ♠Q may lead.',
+        scenario: _hintScenario(
+          label: 'LEGAL OPENING',
+          cards: [
+            _hintCard(rank: '7', suit: 'Clubs', highlighted: true),
+            _hintCard(rank: 'Q', suit: 'Spades'),
+          ],
+          arrow: '✓        ✗',
+        ),
+      );
+      return;
+    }
+
+    // Must follow the led suit when a legal card of that suit exists.
+    if (ledSuit != null &&
+        players[0].cards.any((c) => c.suit == ledSuit)) {
+      await _showRuleHintOnce(
+        key: 'proactive_follow_suit',
+        title: 'FOLLOW THE LED SUIT',
+        message:
+            'The led suit is $ledSuit. You have a card of that suit, so you must play it. '
+            'Choose your best legal card from that suit.',
+        scenario: _hintScenario(
+          label: 'PLAY THE LED SUIT',
+          cards: [
+            _hintCard(rank: 'K', suit: ledSuit!, highlighted: true),
+            _hintCard(rank: 'A', suit: 'Spades'),
+          ],
+          arrow: '✓        ✗',
+        ),
+      );
+      return;
+    }
+
+    // Hand 1: void in led suit means discard a non-penalty card when possible.
+    if (ledSuit != null &&
+        !players[0].cards.any((c) => c.suit == ledSuit) &&
+        handNumber == 1 &&
+        players[0].cards.any((c) => c.penalty == 0 && !c.isSpadeQueen)) {
+      await _showRuleHintOnce(
+        key: 'proactive_hand_one_safe_discard',
+        title: 'HAND 1 — CHOOSE A SAFE DISCARD',
+        message:
+            'You cannot follow the led suit. In Hand 1, play a non-penalty card '
+            'when you have one. ♠Q is never legal in Hand 1.',
+        scenario: _hintScenario(
+          label: 'SAFE DISCARD',
+          cards: [
+            _hintCard(rank: '5', suit: 'Clubs', highlighted: true),
+            _hintCard(rank: '5', suit: 'Hearts'),
+          ],
+          arrow: '✓        ✗',
+        ),
+      );
+      return;
+    }
+
+    // Hands 2–13: if void in led suit and holding ♠Q, ♠Q is mandatory.
+    if (ledSuit != null &&
+        !players[0].cards.any((c) => c.suit == ledSuit) &&
+        handNumber >= 2 &&
+        players[0].cards.any((c) => c.isSpadeQueen)) {
+      await _showRuleHintOnce(
+        key: 'proactive_queen_transfer',
+        title: '♠Q MUST BE PLAYED',
+        message:
+            'You have no card of the led suit and you hold ♠Q. In Hands 2–13, '
+            'you must play ♠Q. This transfers the 12-point Queen penalty to the Hand winner.',
+        scenario: _hintScenario(
+          label: 'MANDATORY PLAY',
+          cards: [
+            _hintCard(rank: 'Q', suit: 'Spades', highlighted: true),
+            _hintCard(rank: 'K', suit: 'Clubs'),
+          ],
+          arrow: 'PLAY ♠Q ✓',
+        ),
+      );
+      return;
+    }
+
+    // Global consecutive-lead restriction: explain it before the player chooses.
+    if (currentHand.isEmpty &&
+        !spadeQueenPlayedThisRound &&
+        globalConsecutiveLedSuit != null &&
+        globalConsecutiveLedSuitCount >= 2 &&
+        !blockedSuitHasOnlyLegalLeadOptions(0)) {
+      await _showRuleHintOnce(
+        key: 'proactive_lead_limit',
+        title: 'CHANGE THE LEAD SUIT',
+        message:
+            'The suit ${globalConsecutiveLedSuit!} was led in the previous two Hands. '
+            'Choose another legal suit for this Hand unless that blocked suit is your only legal lead.',
+        scenario: _hintFlow(
+          title: 'CHOOSE A DIFFERENT LEGAL SUIT',
+          steps: [
+            Column(children: [
+              const Text('BLOCKED', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+              _hintCard(rank: '6', suit: globalConsecutiveLedSuit!),
+              const Text('✗', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900)),
+            ]),
+            _hintArrow('→'),
+            Column(children: [
+              const Text('TRY ANOTHER', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+              _hintCard(rank: '8', suit: 'Clubs', highlighted: true),
+              const Text('✓', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900)),
+            ]),
+          ],
+        ),
+      );
+    }
   }
 
   Future<void> _showHintForIllegalPlay(CardModel card) async {
@@ -2282,7 +2436,8 @@ class _BreyGameState extends State<BreyGame> {
         key: 'first_lead',
         title: 'START WITH A SAFE CARD',
         message:
-            'In Hand 1, lead a non-penalty ♣ or ♦ when one is available. '
+            'In Hand 1, the dealer’s RIGHT-side player starts and play then moves RIGHT around the table. '
+            'Lead a non-penalty ♣ or ♦ when one is available. '
             'If none is available, any card except ♠Q may lead.',
         scenario: _hintScenario(
           label: 'Choose this ✓, not this ✗',
@@ -2317,7 +2472,7 @@ class _BreyGameState extends State<BreyGame> {
             _hintArrow('→'),
             Column(
               children: [
-                const Text('YOU HAVE ♦', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+                _coloredSuitText('YOU HAVE ♦', style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold), textAlign: TextAlign.center),
                 _hintCard(rank: 'K', suit: 'Diamonds', highlighted: true),
               ],
             ),
@@ -2453,6 +2608,7 @@ class _BreyGameState extends State<BreyGame> {
         dealingPhase ||
         handCollecting ||
         _handResolving ||
+        _handTransitionDelay ||
         currentHand.length >= 4) {
       return;
     }
@@ -2477,17 +2633,20 @@ class _BreyGameState extends State<BreyGame> {
       return;
     }
     playCard(0, card);
+    _verifyCardConservation('HUMAN player 0 Hand $handNumber');
 
-    setState(() {});
+    if (mounted) {
+      setState(() {});
+    }
 
-    // If another BOT needs to play.
-    if (
-      !exchangePhase &&
-      !roundFinished &&
-      currentHand.length < 4 &&
-      currentPlayerIndex != 0
-    ) {
-      _scheduleBotTurn(const Duration(milliseconds: 500));
+    // Start the single BOT state-machine only when the new turn actually
+    // belongs to a BOT. No independent delayed callbacks are created here.
+    if (currentPlayerIndex != 0 &&
+        !exchangePhase &&
+        !roundFinished &&
+        !gameOver &&
+        currentHand.length < 4) {
+      _scheduleBotTurn();
     }
   }
 
@@ -2501,7 +2660,19 @@ class _BreyGameState extends State<BreyGame> {
   ) {
     // Absolute state guard: once four cards are on the table, the Hand is
     // complete and no fifth card may ever be removed from any player's hand.
-    if (currentHand.length >= 4 || handCollecting || _handResolving) {
+    if (currentHand.length >= 4 || handCollecting || _handResolving || _handTransitionDelay) {
+      return;
+    }
+
+    // A player may play only on their actual turn. This prevents an old
+    // delayed BOT callback (or a repeated UI callback) from removing a
+    // second card before the other players have completed the Hand.
+    if (playerIndex != currentPlayerIndex) {
+      return;
+    }
+
+    // Every player may contribute exactly one card to a Hand.
+    if (_playersPlayedThisHand.contains(playerIndex)) {
       return;
     }
 
@@ -2509,22 +2680,14 @@ class _BreyGameState extends State<BreyGame> {
       return;
     }
 
+    // FINAL AUTHORITATIVE LEGALITY GATE. Human and BOT moves use exactly the
+    // same rule engine. A strategy function can never remove an illegal card.
+    if (!isLegalCard(playerIndex, card)) {
+      return;
+    }
+
     final bool wasLeading = currentHand.isEmpty;
     final String? suitBeforePlay = ledSuit;
-
-    // Capture whether the player was genuinely void in the led suit before
-    // this card is removed. A locked ♠Q does not count as a legal follower.
-    bool wasVoidInLedSuit = false;
-    if (!wasLeading && suitBeforePlay != null) {
-      wasVoidInLedSuit = !players[playerIndex].cards.any((candidate) {
-        if (candidate.suit != suitBeforePlay) return false;
-        if (candidate.isSpadeQueen &&
-            spadeQueenLockedByPlayer[playerIndex]) {
-          return false;
-        }
-        return true;
-      });
-    }
 
     // ========================================================
     // FIRST CARD OF HAND = LEAD
@@ -2552,32 +2715,6 @@ class _BreyGameState extends State<BreyGame> {
       voidSuitsByPlayer[playerIndex].add(suitBeforePlay);
     }
 
-    // ========================================================
-    // ♠Q LOCK / UNLOCK
-    // ========================================================
-    //
-    // Hands 2–12:
-    // - Q played voluntarily -> no lock.
-    // - Q declined while void in the led suit -> lock Q.
-    // Hand 13 creates no new lock.
-    // A♠ or K♠ played by the same player releases the lock.
-    final bool qWasLockedBeforePlay =
-        spadeQueenLockedByPlayer[playerIndex];
-
-    if (card.isSpadeQueen) {
-} else if (card.suit == 'Spades' &&
-        (card.rank == 'A' || card.rank == 'K') &&
-        qWasLockedBeforePlay) {
-} else if (!wasLeading &&
-        wasVoidInLedSuit &&
-        handNumber >= 2 &&
-        handNumber <= 12 &&
-        players[playerIndex].cards.any((candidate) => candidate.isSpadeQueen) &&
-        !spadeQueenLockedByPlayer[playerIndex]) {
-      // The player was void and deliberately chose another legal card
-      // instead of the unlocked ♠Q.
-}
-
     unawaited(_playFeedback());
 
     // Remove card from player's hand.
@@ -2590,7 +2727,7 @@ class _BreyGameState extends State<BreyGame> {
         card: card,
       ),
     );
-      updateSpadeQueenLockAfterPlay(playerIndex, card);
+    _playersPlayedThisHand.add(playerIndex);
 
 
     playedCardsThisRound.add(card);
@@ -2617,18 +2754,28 @@ class _BreyGameState extends State<BreyGame> {
     // ========================================================
 
     if (currentHand.length < 4) {
-      currentPlayerIndex = nextPlayerAnticlockwise(playerIndex);
+      currentPlayerIndex = nextPlayerForPlay(playerIndex);
 
       message =
           '${players[currentPlayerIndex].name} to play.';
 
       _runGameplayStabilityChecks();
+      if (currentPlayerIndex == 0) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          unawaited(_showHintForCurrentSituation());
+        });
+      }
       return;
     }
 
     // ========================================================
     // HAND COMPLETE
     // ========================================================
+    // Never calculate a Hand from card count alone. All four distinct
+    // players must have played exactly one card.
+    if (currentHand.length != 4 || _playersPlayedThisHand.length != 4) {
+      return;
+    }
 
     _recordCompletedHandBehavior();
     _runGameplayStabilityChecks();
@@ -2639,60 +2786,215 @@ class _BreyGameState extends State<BreyGame> {
   // BOT TURN
   // ==========================================================
 
-  void _scheduleBotTurn(Duration delay) {
-    final int generation = _botTurnGeneration;
+  // ==========================================================
+  // SIMPLE BOT TURN ENGINE
+  // ==========================================================
+  // Exactly one BOT callback may be waiting at a time.
+  // A callback is valid only if its generation still matches the current
+  // game state. This prevents a BOT callback from an old Hand from ever
+  // playing into a new Hand.
+  void _scheduleBotTurn({int delayMs = 720}) {
+    if (!mounted ||
+        exchangePhase ||
+        dealingPhase ||
+        roundFinished ||
+        gameOver ||
+        handCollecting ||
+        _handResolving ||
+        _handTransitionDelay ||
+        currentHand.length >= 4 ||
+        currentPlayerIndex == 0 ||
+        _botTurnScheduled) {
+      return;
+    }
 
-    Future.delayed(delay, () {
-      if (!mounted || generation != _botTurnGeneration) return;
-      playBotTurn();
+    _botTurnScheduled = true;
+    final int token = _botTurnGeneration;
+    final int expectedHand = handNumber;
+    final int expectedPlayer = currentPlayerIndex;
+
+    Future.delayed(Duration(milliseconds: delayMs), () {
+      _botTurnScheduled = false;
+
+      // A new Hand/Round may have started while this callback was waiting.
+      // The new state is responsible for scheduling its own BOT turn.
+      if (!mounted ||
+          token != _botTurnGeneration ||
+          expectedHand != handNumber ||
+          expectedPlayer != currentPlayerIndex) {
+        return;
+      }
+
+      // Temporary transition states are recoverable. Do not silently abandon
+      // a BOT turn; queue a retry against the same state generation.
+      if (exchangePhase ||
+          dealingPhase ||
+          roundFinished ||
+          gameOver ||
+          handCollecting ||
+          _handResolving ||
+          _handTransitionDelay ||
+          currentHand.length >= 4 ||
+          currentPlayerIndex == 0) {
+        _recoverBotTurnIfNeeded(token, expectedHand);
+        return;
+      }
+
+      final int botIndex = currentPlayerIndex;
+      final Player bot = players[botIndex];
+
+      if (bot.cards.isEmpty || _playersPlayedThisHand.contains(botIndex)) {
+        _recoverBotTurnIfNeeded(token, expectedHand);
+        return;
+      }
+
+      try {
+        // Always regenerate the legal set immediately before playing. This
+        // prevents stale strategy state from ever blocking a BOT turn.
+        List<CardModel> legalCards = bot.cards
+            .where((card) => isLegalCard(botIndex, card))
+            .toList();
+
+        if (legalCards.isEmpty) {
+          // Re-evaluate once from a fresh hand snapshot before giving up.
+          legalCards = List<CardModel>.from(bot.cards)
+              .where((card) => isLegalCard(botIndex, card))
+              .toList();
+        }
+
+        if (legalCards.isEmpty) {
+          debugPrint(
+            'BREY BOT: no legal card for player $botIndex. Retrying turn.',
+          );
+          _recoverBotTurnIfNeeded(token, expectedHand);
+          return;
+        }
+
+        CardModel chosen;
+        try {
+          chosen = chooseBotCard(botIndex, bot);
+        } catch (error, stack) {
+          // Strategy failure must never freeze the game. Fall back to the
+          // first card from the already verified legal set.
+          debugPrint('BREY BOT strategy error: $error');
+          debugPrint('$stack');
+          chosen = legalCards.first;
+        }
+
+        // Final legality fallback. If strategy returned anything stale or
+        // illegal, immediately replace it with a verified legal card.
+        if (!legalCards.any((c) => cardKey(c) == cardKey(chosen))) {
+          chosen = legalCards.first;
+        }
+
+        final int beforeHand = currentHand.length;
+        final int beforeCards = bot.cards.length;
+
+        playCard(botIndex, chosen);
+
+        final bool played =
+            bot.cards.length == beforeCards - 1 &&
+            currentHand.length == beforeHand + 1 &&
+            _playersPlayedThisHand.contains(botIndex);
+
+        if (!played) {
+          // One immediate fresh legal-card attempt. This catches rare races
+          // without starting a second BOT engine.
+          final List<CardModel> retryLegal = bot.cards
+              .where((card) => isLegalCard(botIndex, card))
+              .toList();
+
+          if (retryLegal.isNotEmpty &&
+              currentPlayerIndex == botIndex &&
+              currentHand.length < 4 &&
+              !_playersPlayedThisHand.contains(botIndex)) {
+            playCard(botIndex, retryLegal.first);
+          }
+
+          final bool retryPlayed =
+              bot.cards.length == beforeCards - 1 &&
+              currentHand.length == beforeHand + 1 &&
+              _playersPlayedThisHand.contains(botIndex);
+
+          if (!retryPlayed) {
+            debugPrint(
+              'BREY BOT: play rejected for player $botIndex. Recovering turn.',
+            );
+            _recoverBotTurnIfNeeded(token, expectedHand);
+            return;
+          }
+        }
+
+        _botRecoveryAttempts = 0;
+        _verifyCardConservation('BOT player $botIndex Hand $handNumber');
+
+        if (mounted) {
+          setState(() {});
+        }
+
+        // The fourth card belongs to completeHand(). Never schedule another
+        // BOT while the Hand is being resolved or collected.
+        if (currentHand.length == 4 ||
+            _handResolving ||
+            _handTransitionDelay ||
+            handCollecting) {
+          return;
+        }
+
+        if (currentPlayerIndex != 0) {
+          _scheduleBotTurn();
+        }
+      } catch (error, stack) {
+        // A defensive catch is essential: an exception inside a delayed
+        // callback otherwise leaves the table waiting forever for a BOT.
+        debugPrint('BREY BOT turn error for player $botIndex: $error');
+        debugPrint('$stack');
+        _recoverBotTurnIfNeeded(token, expectedHand);
+      }
     });
   }
 
-  void playBotTurn() {
-    if (!mounted) {
-      return;
-    }
-
-    if (exchangePhase ||
+  void _recoverBotTurnIfNeeded(int token, int expectedHand) {
+    if (!mounted ||
+        token != _botTurnGeneration ||
+        expectedHand != handNumber ||
+        exchangePhase ||
+        dealingPhase ||
         roundFinished ||
         gameOver ||
-        dealingPhase ||
-        handCollecting ||
-        _handResolving ||
-        currentHand.length >= 4) {
+        currentHand.length >= 4 ||
+        currentPlayerIndex == 0 ||
+        _botTurnScheduled) {
       return;
     }
 
-    if (currentPlayerIndex == 0) {
-      return;
-    }
+    // Recovery is deliberately not capped at a small number. A transient
+    // animation/state race must never leave a BOT permanently stuck. The
+    // normal successful play resets this counter to zero.
+    _botRecoveryAttempts++;
 
-    Player bot = players[currentPlayerIndex];
+    final int retryDelay = _botRecoveryAttempts <= 2 ? 120 : 250;
 
-    CardModel chosenCard =
-        chooseBotCard(
-      currentPlayerIndex,
-      bot,
-    );
+    Future.delayed(Duration(milliseconds: retryDelay), () {
+      if (!mounted || token != _botTurnGeneration) return;
+      if (currentPlayerIndex == 0 ||
+          currentHand.length >= 4 ||
+          roundFinished ||
+          gameOver) {
+        return;
+      }
 
-    playCard(
-      currentPlayerIndex,
-      chosenCard,
-    );
-
-    setState(() {});
-
-    // Continue BOT turns.
-    if (
-      !exchangePhase &&
-      !roundFinished &&
-      currentHand.length < 4 &&
-      currentPlayerIndex != 0
-    ) {
-      _scheduleBotTurn(const Duration(milliseconds: 550));
-    }
+      if (_botTurnScheduled) return;
+      _scheduleBotTurn(delayMs: retryDelay);
+    });
   }
 
+  // Compatibility wrapper for older call sites. It does not create a second
+  // engine; it simply asks the same scheduler to perform the next BOT move.
+  void playBotTurn() {
+    if (_botTurnScheduled) return;
+    _scheduleBotTurn();
+  }
 
   String cardKey(CardModel card) => '${card.suit}|${card.rank}';
 
@@ -2717,11 +3019,11 @@ class _BreyGameState extends State<BreyGame> {
     clearPrivateExchangeKnowledge();
 
     // Each player knows:
-    // 1. the destination of the four cards THEY passed;
-    // 2. the four cards THEY received.
+    // 1. the destination of the four cards THEY passed (to their LEFT);
+    // 2. the four cards THEY received (from their LEFT).
     // No player is given another player's exchange information.
     for (int viewer = 0; viewer < 4; viewer++) {
-      final int receiver = playerOnLeft(viewer);
+      final int receiver = playerOnRight(viewer);
       final List<CardModel> passed =
           passedCardsByPlayer[viewer] ?? const <CardModel>[];
       for (final CardModel card in passed) {
@@ -3349,6 +3651,22 @@ class _BreyGameState extends State<BreyGame> {
     }
   }
 
+  // Human-target aggression is deliberately stronger at every BOT level.
+  // The BOT still evaluates only legal cards; this changes strategic priority,
+  // not the BREY rule engine.
+  double humanAttackMultiplier() {
+    // The human is always the primary target. Even EASY uses the same
+    // attack philosophy; difficulty changes execution quality, not target.
+    switch (botDifficulty) {
+      case BotDifficulty.easy:
+        return 2.00;
+      case BotDifficulty.medium:
+        return 2.40;
+      case BotDifficulty.hard:
+        return 3.00;
+    }
+  }
+
   // ==========================================================
   // PHASE 2 — OPPONENT SCORE ATTACK
   // ==========================================================
@@ -3356,6 +3674,11 @@ class _BreyGameState extends State<BreyGame> {
   // PUBLIC cumulative scores. It does not inspect hidden opponent hands.
   // It only biases an already-legal candidate; legality remains authoritative.
   int opponentScoreAttackTarget(int botIndex) {
+    // The human player is the intentional primary target for every BOT.
+    // BOT 0 is the human itself, so it falls back to the normal highest-score
+    // opponent logic when this helper is used for that player.
+    if (botIndex != 0) return 0;
+
     int target = -1;
     int targetScore = -1;
     for (int opponent = 0; opponent < players.length; opponent++) {
@@ -3375,12 +3698,20 @@ class _BreyGameState extends State<BreyGame> {
       return 0.0;
     }
     final int targetScore = players[opponent].score;
+    double base;
     switch (attackScoreBand(targetScore)) {
-      case 4: return 180.0;
-      case 3: return 120.0;
-      case 2: return 55.0;
-      default: return 10.0;
+      case 4: base = 180.0; break;
+      case 3: base = 120.0; break;
+      case 2: base = 55.0; break;
+      default: base = 10.0; break;
     }
+
+    // Player 0 is the human. Every BOT intentionally gives the human a
+    // stronger strategic weight than the other opponents.
+    if (opponent == 0) {
+      base *= humanAttackMultiplier();
+    }
+    return base;
   }
 
   double scoreOpponentScoreAttack(
@@ -3444,7 +3775,12 @@ class _BreyGameState extends State<BreyGame> {
       score += 35.0;
     }
 
-    return score.clamp(0.0, 260.0).toDouble();
+    // Explicitly reinforce the human as the primary attack target.
+    if (target == 0) {
+      score *= humanAttackMultiplier();
+    }
+
+    return score.clamp(0.0, 650.0).toDouble();
   }
 
   double penaltyHuntingTargetScore(
@@ -3526,7 +3862,10 @@ class _BreyGameState extends State<BreyGame> {
       if (opponent == botIndex) continue;
 
       final int targetScore = players[opponent].score;
-      final double pressure = targetMultiplier(targetScore);
+      double pressure = targetMultiplier(targetScore);
+      if (opponent == 0) {
+        pressure *= humanAttackMultiplier();
+      }
       final bool targetVoid = voidSuitsByPlayer[opponent]
           .contains(candidate.suit);
       final double transferable = transferablePenaltyForTarget(opponent);
@@ -3728,7 +4067,10 @@ class _BreyGameState extends State<BreyGame> {
         }
 
         final int opponentScore = players[opponent].score;
-        final double pressure = attackPressureMultiplier(opponentScore);
+        double pressure = attackPressureMultiplier(opponentScore);
+        if (opponent == 0) {
+          pressure *= humanAttackMultiplier();
+        }
 
         // A known void gives the opponent an opportunity to discard a card
         // from another suit. Count only penalty cards that are still unseen
@@ -3798,8 +4140,10 @@ class _BreyGameState extends State<BreyGame> {
       score *= 0.82;
     }
 
-    // Never let this strategic layer overwhelm the rest of the engine.
-    return score.clamp(-150.0, 450.0).toDouble();
+    // Never let this strategic layer overwhelm the legality engine.
+    // Human-target opportunities receive the stronger difficulty-scaled weight
+    // through the pressure multiplier above.
+    return score.clamp(-150.0, 700.0).toDouble();
   }
 
   // ==========================================================
@@ -3839,8 +4183,11 @@ class _BreyGameState extends State<BreyGame> {
         );
         if (confidence <= 0.0) continue;
 
-        final double pressure =
+        double pressure =
             attackPressureMultiplier(players[opponent].score);
+        if (opponent == 0) {
+          pressure *= humanAttackMultiplier();
+        }
 
         score += confidence * 210.0 * pressure;
 
@@ -3896,6 +4243,106 @@ class _BreyGameState extends State<BreyGame> {
     return score.clamp(-250.0, 550.0).toDouble();
   }
 
+  // ==========================================================
+  // HUMAN TARGET — 200% DIRECT ATTACK
+  // ==========================================================
+  // Every BOT deliberately treats the human player (index 0) as the primary
+  // attack target. This does NOT reveal hidden human cards: it uses only
+  // public score state, public void information, the current Hand, and the
+  // BOT's legitimate card-ownership knowledge. The legal-card engine remains
+  // authoritative, so aggression can only select from legal moves.
+  double scoreHumanAttack200Percent(
+    int botIndex,
+    CardModel candidate, {
+    required bool leading,
+    required bool winning,
+  }) {
+    if (botIndex == 0) return 0.0;
+
+    const int humanIndex = 0;
+    final int humanScore = players[humanIndex].score;
+    final bool humanVoid =
+        voidSuitsByPlayer[humanIndex].contains(candidate.suit);
+    final int currentWinner = determineCurrentWinner();
+    final double visiblePenalty = currentHandPenaltyTotal();
+
+    // The attack intensifies as the human approaches the game threshold.
+    double pressure;
+    if (humanScore >= 100) {
+      pressure = 4.0;
+    } else if (humanScore >= 94) {
+      pressure = 3.5;
+    } else if (humanScore >= 88) {
+      pressure = 3.0;
+    } else if (humanScore >= 60) {
+      pressure = 2.0;
+    } else {
+      pressure = 1.5;
+    }
+
+    double score = 0.0;
+
+    // ZERO-POINT PREVENTION: whenever the current Hand already contains
+    // penalty cards and the human is currently winning, strongly prefer a
+    // legal move that makes the human lose the Hand or keeps the Hand pointed
+    // at the human when a penalty can be transferred to them. This is still
+    // rule-safe: it never invents a hidden human card or chooses an illegal
+    // move.
+    if (!leading && currentWinner == humanIndex && visiblePenalty > 0) {
+      score += 900.0 * pressure;
+      if (candidate.penalty > 0 && !winning) {
+        score += candidate.penalty * 140.0 * pressure;
+      }
+    }
+
+    // Primary attack: lead a suit the human has publicly been shown to be
+    // void in, creating a legal penalty-discard opportunity.
+    if (leading && humanVoid) {
+      score += 260.0 * pressure;
+      score += knownOpponentPenaltyInSuit(candidate.suit, humanIndex) *
+          24.0 * pressure;
+    } else if (leading) {
+      score += knownOpponentPenaltyInSuit(candidate.suit, humanIndex) *
+          10.0 * pressure;
+    }
+
+    // If the human is already winning a loaded Hand, keep that Hand pointed
+    // at them whenever the BOT can legally lose the current trick.
+    if (!leading && currentWinner == humanIndex && !winning) {
+      score += visiblePenalty * 55.0 * pressure;
+      if (candidate.penalty > 0) {
+        score += candidate.penalty * 75.0 * pressure;
+      }
+    }
+
+    // A known human-owned penalty card in the candidate's suit is an especially
+    // strong public-information attack signal. Never assume an unknown card.
+    final int knownPenalty =
+        knownOpponentPenaltyInSuit(candidate.suit, humanIndex);
+    if (knownPenalty > 0) {
+      score += knownPenalty * 18.0 * pressure;
+    }
+
+    // With a human near 100, prioritize moves that make them collect visible
+    // penalties rather than merely improving a neutral position.
+    if (humanScore >= 88) {
+      if (currentWinner == humanIndex && visiblePenalty > 0 && !winning) {
+        score += visiblePenalty * 45.0 * pressure;
+      }
+      if (candidate.penalty > 0 && currentWinner == humanIndex && !winning) {
+        score += candidate.penalty * 90.0 * pressure;
+      }
+    }
+
+    // Never reward the BOT for taking the penalty itself merely because it is
+    // aggressive. The existing winner/self-preservation layers remain in force.
+    if (winning && candidate.penalty > 0) {
+      score -= candidate.penalty * 35.0;
+    }
+
+    return score.clamp(0.0, 1800.0).toDouble();
+  }
+
   double scoreAttack200Percent(
     int botIndex,
     CardModel candidate, {
@@ -3903,6 +4350,15 @@ class _BreyGameState extends State<BreyGame> {
     required bool winning,
   }) {
     double score = 0;
+
+    // PRIMARY TARGET — human player (index 0).
+    // This is intentionally stronger than generic opponent pressure.
+    score += scoreHumanAttack200Percent(
+      botIndex,
+      candidate,
+      leading: leading,
+      winning: winning,
+    );
 
     // PHASE 2 — explicit opponent score attack.
     score += scoreOpponentScoreAttack(
@@ -4383,6 +4839,16 @@ class _BreyGameState extends State<BreyGame> {
     return score;
   }
 
+// ==========================================================
+// BOT DIRECTION CONTRACT
+// ==========================================================
+// Exchange strategy evaluates the player on the RIGHT because every BOT
+// passes its selected four cards to the LEFT and receives four from the RIGHT.
+// Gameplay strategy evaluates turn order using nextPlayerForPlay(), which
+// moves LEFT. Therefore when the human is the dealer the first Hand is:
+// BOT 1 -> BOT 2 -> BOT 3 -> YOU.
+// This direction is part of the BREY rules, not a visual/UI convention.
+
 CardModel chooseBotCard(
     int playerIndex,
     Player bot,
@@ -4399,8 +4865,8 @@ CardModel chooseBotCard(
         .toList();
 
     if (legalCards.isEmpty) {
-      // This should never occur in a valid game state, but do not let the
-      // intelligence layer manufacture an illegal move.
+      // Invalid state: return a card only so the caller can log/reject it.
+      // playCard() has the final authoritative legality gate.
       return bot.cards.first;
     }
 
@@ -4920,9 +5386,9 @@ CardModel chooseBotCard(
       if (opponent == botIndex) continue;
 
       final int firstOpponentAfterBot =
-          nextPlayerAnticlockwise(botIndex);
+          nextPlayerForPlay(botIndex);
       final bool opponentIsNext =
-          opponent == nextPlayerAnticlockwise(currentPlayerIndex);
+          opponent == nextPlayerForPlay(currentPlayerIndex);
       final bool opponentIsLast = currentHand.length == 2 &&
           opponent == firstOpponentAfterBot;
 
@@ -6724,6 +7190,37 @@ CardModel chooseBotCard(
         .where((c) => c.value < currentWinningValue)
         .toList();
 
+    // ======================================================
+    // HARD PENALTY-TRANSFER PRIORITY
+    // ======================================================
+    // If an opponent is currently winning the led suit, and this BOT can
+    // legally follow with a penalty card that is guaranteed to lose, unload
+    // the penalty now. This is the concrete BREY transfer behavior: for
+    // example, K♦ on the table + J♦ in the BOT hand => play J♦ (4 points),
+    // rather than unnecessarily throwing a zero-point Diamond.
+    //
+    // This is still rules-first: every candidate below has already passed
+    // isLegalCard(), and a penalty that would WIN the Hand is not forced.
+    final List<CardModel> safePenaltyTransfers = losing
+        .where((c) => c.penalty > 0 && isLegalCard(playerIndex, c))
+        .toList();
+
+    if (safePenaltyTransfers.isNotEmpty) {
+      CardModel bestPenalty = safePenaltyTransfers.first;
+      double bestPenaltyScore = -double.infinity;
+      for (final CardModel candidate in safePenaltyTransfers) {
+        double penaltyScore = scorePenaltyHuntMemory(playerIndex, candidate, losing: true);
+        penaltyScore += candidate.penalty * 8.0;
+        penaltyScore += candidate.value * 0.25;
+        if (penaltyScore > bestPenaltyScore ||
+            (penaltyScore == bestPenaltyScore && isBetterBotTieBreak(candidate, bestPenalty))) {
+          bestPenaltyScore = penaltyScore;
+          bestPenalty = candidate;
+        }
+      }
+      return bestPenalty;
+    }
+
     // If we can safely lose the Hand, choose the card that gives us the best
     // future position rather than simply throwing the lowest card.
     if (losing.isNotEmpty) {
@@ -7023,6 +7520,49 @@ CardModel chooseBotCard(
   // BOT DISCARD / BREY TRANSFER — USE THE BEST TARGET
   // ==========================================================
 
+  // ==========================================================
+  // BREY PENALTY HUNTING — EXCHANGE MEMORY + PUBLIC CARD COUNTING
+  // ==========================================================
+  bool _wasReceivedFromRightPlayer(int botIndex, CardModel card) {
+    // Exchange moves LEFT (anti-clockwise), so a BOT receives from its RIGHT neighbour.
+    final int rightPlayer = playerOnRight(botIndex);
+    final String key = cardKey(card);
+    final List<CardModel> received =
+        receivedCardsByPlayer[botIndex] ?? const <CardModel>[];
+    final List<CardModel> rightPassed =
+        passedCardsByPlayer[rightPlayer] ?? const <CardModel>[];
+    return received.any((c) => cardKey(c) == key) &&
+        rightPassed.any((c) => cardKey(c) == key);
+  }
+
+  int _publicUnplayedHigherCardsInSuit(CardModel card) {
+    int count = 0;
+    for (final CardModel unseen in remainingUnseenSuitCards(card.suit)) {
+      if (unseen.value > card.value) count++;
+    }
+    return count;
+  }
+
+  double scorePenaltyHuntMemory(int botIndex, CardModel candidate, {required bool losing}) {
+    if (candidate.penalty <= 0 || !losing) return 0;
+    double score = 0;
+    final int currentWinner = determineCurrentWinner();
+    final int rightPlayer = playerOnRight(botIndex);
+    if (_wasReceivedFromRightPlayer(botIndex, candidate)) {
+      score += 180 + candidate.penalty * 55;
+      if (currentWinner == rightPlayer) score += 320 + candidate.penalty * 90;
+    }
+    if (currentWinner >= 0 && currentWinner != botIndex) {
+      final int targetScore = players[currentWinner].score;
+      score += candidate.penalty * (targetScore >= 94 ? 110 : targetScore >= 88 ? 72 : 30);
+      if (currentWinner == rightPlayer) score += 90 + candidate.penalty * 35;
+    }
+    score += _publicUnplayedHigherCardsInSuit(candidate) * 12.0;
+    score += candidate.penalty * 24;
+    score += candidate.value * 1.5;
+    return score;
+  }
+
   CardModel chooseSmartDiscardCard(
     int playerIndex,
     Player bot,
@@ -7032,6 +7572,20 @@ CardModel chooseBotCard(
         .toList();
 
     if (legalCards.isEmpty) return bot.cards.first;
+
+    // When void in the led suit, dump the largest legal penalty whenever
+    // possible. ♠Q remains governed by the authoritative legality engine.
+    final List<CardModel> legalPenaltyCards = legalCards
+        .where((c) => c.penalty > 0)
+        .toList();
+    if (legalPenaltyCards.isNotEmpty) {
+      legalPenaltyCards.sort((a, b) {
+        final int penaltyCompare = b.penalty.compareTo(a.penalty);
+        if (penaltyCompare != 0) return penaltyCompare;
+        return b.value.compareTo(a.value);
+      });
+      return legalPenaltyCards.first;
+    }
 
     CardModel best = legalCards.first;
     double bestScore = -double.infinity;
@@ -7082,6 +7636,7 @@ CardModel chooseBotCard(
       );
       score += scoreFullHandSimulation(playerIndex, candidate, winning: false);
       score += scorePenaltyTransferTarget(playerIndex, candidate);
+      score += scorePenaltyHuntMemory(playerIndex, candidate, losing: true);
       score += scoreSpadeQueenPrediction(playerIndex, candidate);
 
       for (int opponent = 0; opponent < 4; opponent++) {
@@ -7629,53 +8184,43 @@ CardModel chooseBotCard(
     // result on the table.
     message = 'Hand $handNumber complete.';
 
-    // Keep the four cards on the table and begin a short collection
-    // animation toward the Hand winner. The scoring above has already
-    // happened, so the animation is purely visual.
+    // ========================================================
+    // HAND PROCESSING COMPLETE — SIMPLE, STABLE TRANSITION
+    // ========================================================
+    // Do NOT run a long collection animation here. The scoring, winner
+    // calculation, penalty accounting, and round-history snapshot are all
+    // already complete above. Keeping the table animation out of the state
+    // transition prevents delayed animation callbacks from racing with the
+    // next Hand and accidentally consuming/clearing cards.
+    //
+    // The completed Hand is removed from the table immediately, then the
+    // game remains locked for exactly 1 second. Only after that second may
+    // the next Hand begin and a card be played.
+    // IMPORTANT: keep all four cards on the BREY table for the complete-Hand
+    // display interval.  Previously currentHand.clear() happened in the same
+    // state transition that scored the Hand. Flutter could therefore rebuild
+    // the table before the fourth/last card was ever painted.
+    //
+    // Scoring is already finished at this point, but the physical table must
+    // remain untouched until the one-second transition lock expires. No BOT
+    // can play during this period because _handTransitionDelay is true.
     if (mounted) {
       setState(() {
-        handCollecting = true;
+        handCollecting = false;
         collectingWinnerIndex = winnerIndex;
+        _handTransitionDelay = true;
       });
     } else {
-      handCollecting = true;
-      collectingWinnerIndex = winnerIndex;
-    }
-
-    // ========================================================
-    // WAIT FOR COLLECTION ANIMATION
-    // ========================================================
-    //
-    // The four cards first animate toward the Hand winner.
-    // Only AFTER that animation finishes do we remove the cards
-    // and continue directly into the next game state.
-    final int collectionAnimationMs =
-        _animationSpeed == 'fast' ? 750 : 850;
-
-    await Future.delayed(
-      Duration(milliseconds: collectionAnimationMs),
-    );
-
-    if (!mounted) return;
-
-    // Only the same completed Hand that entered the resolution phase may
-    // clear the table. A stale callback must never remove cards from a new Hand.
-    if (currentHand.length != 4) {
-      _handResolving = false;
-      return;
-    }
-
-    setState(() {
       handCollecting = false;
-      collectingWinnerIndex = null;
-      currentHand.clear();
-    });
+      collectingWinnerIndex = winnerIndex;
+      _handTransitionDelay = true;
+    }
 
-    // The completed table is now safely cleared. The next Hand may resolve.
+    // Keep the completed four-card table visible for one full second before
+    // clearing it. This is the ONLY place where a completed Hand is cleared.
+    // Keeping the cards here also guarantees the last player's card gets a
+    // real Flutter frame to render.
     _handResolving = false;
-
-    // Collection is complete. Continue immediately with no Hand-result
-    // popup, keeping the game flow seamless.
 
     if (!mounted) return;
 
@@ -7687,10 +8232,12 @@ CardModel chooseBotCard(
       // Hand 13 must ALWAYS complete Round-end processing before
       // checking whether anyone has reached 100+.
       Future.delayed(
-        const Duration(milliseconds: 2000),
+        const Duration(seconds: 1),
         () async {
           if (!mounted) return;
           setState(() {
+            currentHand.clear();
+            _playersPlayedThisHand.clear();
             handCollecting = false;
             collectingWinnerIndex = null;
           });
@@ -7708,7 +8255,7 @@ CardModel chooseBotCard(
       unawaited(_playFeedback(strongVibration: true));
       _recordCompletedGame(reached100Index: winnerIndex);
       Future.delayed(
-        const Duration(milliseconds: 2000),
+        const Duration(seconds: 1),
         () async {
           if (!mounted) return;
           setState(() {
@@ -7730,15 +8277,25 @@ CardModel chooseBotCard(
       return;
     }
 
-    final int transitionMs = _animationSpeed == 'fast' ? 1300 : 2350;
-    Future.delayed(
-      Duration(milliseconds: transitionMs),
-      () {
-        if (mounted) {
-          startNextHand(winnerIndex);
-        }
-      },
-    );
+    // EXACTLY 1 SECOND SAFETY WINDOW
+    // All calculations and state changes above are finished before this
+    // delay begins. No player is allowed to play during this window.
+    await Future.delayed(const Duration(seconds: 1));
+
+    if (!mounted || roundFinished || gameOver) return;
+
+    // The completed Hand has now been visible for the full transition
+    // interval. Clear the four table cards only immediately before creating
+    // the next Hand, never at the moment the fourth card is played.
+    setState(() {
+      currentHand.clear();
+      _playersPlayedThisHand.clear();
+      collectingWinnerIndex = null;
+      handCollecting = false;
+      _handTransitionDelay = false;
+    });
+
+    startNextHand(winnerIndex);
   }
 
   // ==========================================================
@@ -7752,12 +8309,16 @@ CardModel chooseBotCard(
 
     // Start a fresh BOT-turn generation for this Hand.
     _botTurnGeneration++;
+    _botTurnScheduled = false;
+    _botRecoveryAttempts = 0;
 
     setState(() {
+      _handTransitionDelay = false;
       handCollecting = false;
       collectingWinnerIndex = null;
       _handResolving = false;
       currentHand.clear();
+      _playersPlayedThisHand.clear();
       ledSuit = null;
       handNumber++;
 
@@ -7768,10 +8329,7 @@ CardModel chooseBotCard(
     });
 
     if (currentPlayerIndex != 0) {
-      // Start the next BOT turn only after the previous Hand has completely
-      // finished.  The generation guard prevents an old delayed callback
-      // from playing into the new Hand.
-      _scheduleBotTurn(const Duration(milliseconds: 500));
+      _scheduleBotTurn();
     }
   }
 
@@ -7891,6 +8449,7 @@ CardModel chooseBotCard(
     }
 
     roundNumber++;
+    _firstHandHintShown = false;
 
     // ♠Q collector becomes dealer.
     dealerIndex = spadeQueenCollector!;
@@ -8005,6 +8564,10 @@ CardModel chooseBotCard(
     final double selectedGlow = selected ? 0.22 : (playableNow ? 0.08 : 0.0);
 
     final bool penaltyCard = card.penalty > 0;
+    final double screenWidth = MediaQuery.sizeOf(context).width;
+    final bool compactPhone = screenWidth < 360;
+    final double cardWidth = compactPhone ? 64 : 70;
+    final double cardHeight = compactPhone ? 94 : 102;
 
     return RepaintBoundary(
       child: GestureDetector(
@@ -8027,8 +8590,8 @@ CardModel chooseBotCard(
           child: AnimatedContainer(
             duration: selected ? _cardAnimationDuration(190) : Duration.zero,
             curve: Curves.easeOutCubic,
-            width: 70,
-            height: 102,
+            width: cardWidth,
+            height: cardHeight,
             margin: const EdgeInsets.symmetric(
               horizontal: 3,
               vertical: 5,
@@ -8913,6 +9476,17 @@ CardModel chooseBotCard(
                 color: Colors.black54,
               ),
             ),
+            const SizedBox(height: 5),
+            const Text(
+              'DIRECTION: CHOOSE LEFT  •  PLAY RIGHT',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w900,
+                letterSpacing: 0.7,
+                color: Color(0xff806a38),
+              ),
+            ),
             const SizedBox(height: 14),
             Container(
               padding: const EdgeInsets.all(12),
@@ -9012,7 +9586,7 @@ CardModel chooseBotCard(
     return TweenAnimationBuilder<double>(
       key: ValueKey('${played.playerIndex}-${played.card.shortName}'),
       tween: Tween<double>(begin: 0.84, end: 1.0),
-      duration: _cardAnimationDuration(320),
+      duration: _cardAnimationDuration(480),
       curve: Curves.easeOutBack,
       builder: (context, scale, child) {
         return Transform.scale(
@@ -9269,8 +9843,13 @@ CardModel chooseBotCard(
       final played = currentHand.where((p) => p.playerIndex == playerIndex).toList();
       final playedCard = played.isEmpty ? null : played.first;
 
-      final Widget emptySlot = Container(        width: 64,
-        height: 84,
+      final double tableWidth = MediaQuery.sizeOf(context).width;
+      final bool compactTable = tableWidth < 360;
+      final double slotWidth = compactTable ? 70 : 84;
+      final double slotHeight = compactTable ? 88 : 98;
+
+      final Widget emptySlot = Container(        width: slotWidth - 6,
+        height: slotHeight - 14,
         decoration: BoxDecoration(
           color: Colors.white.withValues(alpha: 0.035),
           borderRadius: BorderRadius.circular(12),
@@ -9333,8 +9912,8 @@ CardModel chooseBotCard(
 
       return RepaintBoundary(
         child: SizedBox(
-          width: 84,
-          height: 98,
+          width: slotWidth,
+          height: slotHeight,
           child: Center(child: displayedCard),
         ),
       );
@@ -9342,9 +9921,14 @@ CardModel chooseBotCard(
 
     // Compact centre information so the four table positions always fit
     // comfortably on smaller phone screens.
+    final double tableWidth = MediaQuery.sizeOf(context).width;
+    final bool compactTable = tableWidth < 360;
+    final double centerWidth = compactTable ? 112 : 132;
+    final double centerHeight = compactTable ? 98 : 112;
+
     final center = Container(
-      width: 132,
-      height: 112,
+      width: centerWidth,
+      height: centerHeight,
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(24),
@@ -9448,7 +10032,12 @@ CardModel chooseBotCard(
               ),
             ),
             Padding(
-              padding: const EdgeInsets.fromLTRB(12, 14, 12, 12),
+              padding: EdgeInsets.fromLTRB(
+                compactTable ? 6 : 12,
+                compactTable ? 9 : 14,
+                compactTable ? 6 : 12,
+                compactTable ? 8 : 12,
+              ),
               child: Column(
                 children: [
                   Row(
@@ -9456,14 +10045,22 @@ CardModel chooseBotCard(
                     children: [
                       const Icon(Icons.spa_outlined, color: Color(0xffd4af63), size: 16),
                       const SizedBox(width: 8),
-                      const Text('BREY TABLE', style: TextStyle(color: Color(0xffe3c27a), fontSize: 15, fontWeight: FontWeight.w800, letterSpacing: 2.2)),
+                      Flexible(
+                        child: FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: const Text('BREY TABLE', style: TextStyle(color: Color(0xffe3c27a), fontSize: 15, fontWeight: FontWeight.w800, letterSpacing: 2.2)),
+                        ),
+                      ),
                       const SizedBox(width: 8),
                       const Icon(Icons.spa_outlined, color: Color(0xffd4af63), size: 16),
                     ],
                   ),
-                  const SizedBox(height: 3),
-                  Text('YOU  →  BOT 1  →  BOT 2  →  BOT 3', style: TextStyle(color: Colors.white.withValues(alpha: 0.48), fontSize: 9.5, letterSpacing: 1.1)),
-                  const SizedBox(height: 4),
+                  SizedBox(height: compactTable ? 1 : 3),
+                  FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Text('YOU  →  BOT 1  →  BOT 2  →  BOT 3', style: TextStyle(color: Colors.white.withValues(alpha: 0.48), fontSize: 9.5, letterSpacing: 1.1)),
+                  ),
+                  SizedBox(height: compactTable ? 2 : 4),
                   buildTablePlayerLabel(2, position: 'top'),
                   cardSlot(2),
                   Row(
@@ -9506,131 +10103,20 @@ CardModel chooseBotCard(
   // ROUND RESULT PANEL
   // ==========================================================
 
-  Widget _roundHistoryCard({
-    required int handIndex,
-    required List<PlayedCard> plays,
-    required int winnerIndex,
-    required int penalty,
-  }) {
-    final int displayHand = handIndex + 1;
-    final String winnerName = players[winnerIndex].name;
-
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(12),
-        color: Colors.grey.shade50,
-        border: Border.all(color: Colors.black12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(8),
-                  color: Colors.indigo.withValues(alpha: 0.10),
-                ),
-                child: Text(
-                  'HAND $displayHand',
-                  style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w900),
-                ),
-              ),
-              const Spacer(),
-              Text(
-                penalty == 0 ? '0 pts' : '+$penalty pts',
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w800,
-                  color: penalty > 0 ? Colors.red.shade700 : Colors.green.shade700,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 7),
-          ...plays.map((played) {
-            final String symbol = played.card.symbol;
-            final bool redSuit = played.card.suit == 'Hearts' ||
-                played.card.suit == 'Diamonds';
-            final bool isWinner = played.playerIndex == winnerIndex;
-
-            return Padding(
-              padding: const EdgeInsets.symmetric(vertical: 2),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      players[played.playerIndex].name,
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: isWinner ? FontWeight.w800 : FontWeight.w500,
-                      ),
-                    ),
-                  ),
-                  Container(
-                    width: 34,
-                    height: 44,
-                    alignment: Alignment.center,
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(7),
-                      border: Border.all(color: Colors.black12),
-                    ),
-                    child: Text(
-                      '${played.card.rank}$symbol',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w800,
-                        color: redSuit ? Colors.red.shade700 : Colors.black87,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  SizedBox(
-                    width: 66,
-                    child: Text(
-                      isWinner ? 'WINNER ✓' : '',
-                      textAlign: TextAlign.right,
-                      style: const TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            );
-          }),
-          const SizedBox(height: 5),
-          Text(
-            'Won by $winnerName  •  $penalty penalty point${penalty == 1 ? '' : 's'}',
-            style: const TextStyle(
-              fontSize: 11,
-              color: Colors.black54,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   Widget _buildRoundHandSummary() {
     if (completedRoundHands.isEmpty) {
       return const SizedBox.shrink();
     }
 
-    final int totalPenalty = completedRoundPenalties.fold<int>(0, (a, b) => a + b);
+    final int totalPenalty =
+        completedRoundPenalties.fold<int>(0, (a, b) => a + b);
 
     return Container(
       width: double.infinity,
-      margin: const EdgeInsets.only(top: 14),
-      padding: const EdgeInsets.fromLTRB(12, 14, 12, 8),
+      margin: const EdgeInsets.only(top: 12),
+      padding: const EdgeInsets.fromLTRB(10, 11, 10, 8),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(12),
         color: const Color(0xfff8f7f3),
         border: Border.all(color: const Color(0xffd7d2c8)),
       ),
@@ -9639,40 +10125,44 @@ CardModel chooseBotCard(
         children: [
           Row(
             children: [
-              const Icon(Icons.history_rounded, size: 20),
-              const SizedBox(width: 7),
+              const Icon(Icons.history_rounded, size: 18),
+              const SizedBox(width: 6),
               const Expanded(
                 child: Text(
-                  '13-HAND ROUND SUMMARY',
-                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w900),
+                  'HAND SUMMARY',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w900),
                 ),
               ),
               Text(
                 '$totalPenalty pts',
-                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w800),
+                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w800),
               ),
             ],
           ),
-          const SizedBox(height: 3),
-          const Text(
-            'Every card played, Hand winner, and actual penalty collected.',
-            style: TextStyle(fontSize: 11, color: Colors.black54),
-          ),
-          const SizedBox(height: 10),
-          SizedBox(
-            height: 520,
-            child: ListView.builder(
-              itemCount: completedRoundHands.length,
-              itemBuilder: (context, index) {
-                return _roundHistoryCard(
-                  handIndex: index,
-                  plays: completedRoundHands[index],
-                  winnerIndex: completedRoundWinners[index],
-                  penalty: completedRoundPenalties[index],
-                );
-              },
-            ),
-          ),
+          const SizedBox(height: 7),
+          ...List<Widget>.generate(completedRoundHands.length, (index) {
+            final List<PlayedCard> plays = completedRoundHands[index];
+            final int winnerIndex = completedRoundWinners[index];
+            final int penalty = completedRoundPenalties[index];
+            final String cards = plays
+                .map((played) => '${played.card.rank}${played.card.symbol}')
+                .join(' ');
+            final String winnerName = players[winnerIndex].name;
+
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 3),
+              child: Text(
+                'H${index + 1}  •  $cards  •  $winnerName won  •  ${penalty == 0 ? '0' : '+$penalty'} pts',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.black87,
+                ),
+              ),
+            );
+          }),
         ],
       ),
     );
@@ -9907,104 +10397,196 @@ CardModel chooseBotCard(
   // BREY RULE BOOK — VISUAL EDITION
   // ==========================================================
 
-  Widget _ruleCardVisual({
-    required String rank,
-    required String suit,
-    bool highlighted = false,
-    bool muted = false,
-  }) {
-    final bool red = suit == 'Hearts' || suit == 'Diamonds';
-    final String symbol = suit == 'Hearts'
-        ? '♥'
-        : suit == 'Diamonds'
-            ? '♦'
-            : suit == 'Clubs'
-                ? '♣'
-                : '♠';
+  TextSpan _coloredSuitSpan(String value, {TextStyle? baseStyle}) {
+    final List<InlineSpan> spans = <InlineSpan>[];
+    final RegExp suitPattern = RegExp(r'[♠♥♦♣]');
+    int start = 0;
+    for (final Match match in suitPattern.allMatches(value)) {
+      if (match.start > start) {
+        spans.add(TextSpan(text: value.substring(start, match.start), style: baseStyle));
+      }
+      final String suit = match.group(0)!;
+      final Color suitColor = suit == '♥' || suit == '♦'
+          ? const Color(0xffd32f2f)
+          : const Color(0xff111827);
+      spans.add(TextSpan(
+        text: suit,
+        style: (baseStyle ?? const TextStyle()).copyWith(
+          color: suitColor,
+          fontWeight: FontWeight.w900,
+        ),
+      ));
+      start = match.end;
+    }
+    if (start < value.length) {
+      spans.add(TextSpan(text: value.substring(start), style: baseStyle));
+    }
+    return TextSpan(children: spans, style: baseStyle);
+  }
 
+  Widget _coloredSuitText(
+    String value, {
+    TextStyle? style,
+    TextAlign textAlign = TextAlign.left,
+  }) {
+    return RichText(
+      textAlign: textAlign,
+      text: _coloredSuitSpan(value, baseStyle: style),
+    );
+  }
+
+  Color _ruleSuitColor(String suit) {
+    return (suit == '♥' || suit == '♦')
+        ? const Color(0xffd32f2f)
+        : const Color(0xff111827);
+  }
+
+  Widget _ruleCard(String rank, String suit, {bool highlighted = false}) {
     return Container(
-      width: 52,
-      height: 70,
+      width: 48,
+      height: 64,
+      margin: const EdgeInsets.symmetric(horizontal: 3),
       decoration: BoxDecoration(
-        color: muted ? const Color(0xffeeeae1) : Colors.white,
-        borderRadius: BorderRadius.circular(9),
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(8),
         border: Border.all(
           color: highlighted
               ? const Color(0xffb58b2a)
               : const Color(0xffd7d2c8),
-          width: highlighted ? 2.4 : 1,
+          width: highlighted ? 2 : 1,
         ),
         boxShadow: const [
           BoxShadow(
-            color: Color(0x22000000),
-            blurRadius: 4,
-            offset: Offset(0, 2),
+            color: Color(0x18000000),
+            blurRadius: 3,
+            offset: Offset(0, 1),
           ),
         ],
       ),
       alignment: Alignment.center,
       child: Text(
-        '$rank$symbol',
+        '$rank$suit',
         style: TextStyle(
-          fontSize: 18,
-          fontWeight: FontWeight.w800,
-          color: muted
-              ? Colors.black38
-              : (red ? Colors.red.shade700 : Colors.black87),
+          fontSize: 17,
+          fontWeight: FontWeight.w900,
+          color: _ruleSuitColor(suit),
         ),
       ),
     );
   }
 
-  Widget _ruleVisual({
+  Widget _ruleBadge(String text, {bool good = true}) {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 3),
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+      decoration: BoxDecoration(
+        color: good ? const Color(0xffeaf7ee) : const Color(0xffffeeee),
+        borderRadius: BorderRadius.circular(9),
+        border: Border.all(
+          color: good ? const Color(0xff9ac9a5) : const Color(0xffe1aaaa),
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            good ? Icons.check_circle_rounded : Icons.cancel_rounded,
+            size: 15,
+            color: good ? const Color(0xff2e7d32) : const Color(0xffb3261e),
+          ),
+          const SizedBox(width: 4),
+          Text(
+            text,
+            style: TextStyle(
+              fontSize: 10.5,
+              fontWeight: FontWeight.w800,
+              color: good ? const Color(0xff245b32) : const Color(0xff8b2020),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _ruleVisualSection({
+    required String number,
     required String title,
     required String explanation,
-    required List<Widget> children,
-    IconData? icon,
+    required List<Widget> visual,
+    IconData icon = Icons.menu_book_rounded,
   }) {
     return Container(
-      margin: const EdgeInsets.only(bottom: 14),
-      padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.fromLTRB(12, 11, 12, 12),
       decoration: BoxDecoration(
-        color: const Color(0xfff7f1e4),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: const Color(0xffdcc58e)),
+        color: const Color(0xfffffdf8),
+        borderRadius: BorderRadius.circular(15),
+        border: Border.all(color: const Color(0xffded7c8)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x10000000),
+            blurRadius: 5,
+            offset: Offset(0, 2),
+          ),
+        ],
       ),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
-            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              if (icon != null) ...[
-                Icon(icon, size: 17, color: const Color(0xff172554)),
-                const SizedBox(width: 6),
-              ],
-              Flexible(
+              Container(
+                width: 29,
+                height: 29,
+                alignment: Alignment.center,
+                decoration: const BoxDecoration(
+                  color: Color(0xffb58b2a),
+                  shape: BoxShape.circle,
+                ),
+                child: Text(
+                  number,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Icon(icon, size: 19, color: const Color(0xff165b43)),
+              const SizedBox(width: 6),
+              Expanded(
                 child: Text(
                   title,
-                  textAlign: TextAlign.center,
                   style: const TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 0.4,
-                    color: Color(0xff172554),
+                    fontSize: 15,
+                    fontWeight: FontWeight.w900,
+                    color: Color(0xff174c3b),
                   ),
                 ),
               ),
             ],
           ),
           const SizedBox(height: 10),
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: children,
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(vertical: 9, horizontal: 5),
+            decoration: BoxDecoration(
+              color: const Color(0xfff5f0e4),
+              borderRadius: BorderRadius.circular(11),
+            ),
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: visual,
+              ),
             ),
           ),
           const SizedBox(height: 9),
-          Text(
+          _coloredSuitText(
             explanation,
-            textAlign: TextAlign.center,
+            textAlign: TextAlign.left,
             style: const TextStyle(
               fontSize: 12.5,
               height: 1.35,
@@ -10016,90 +10598,13 @@ CardModel chooseBotCard(
     );
   }
 
-  Widget _ruleSection(String title, String text) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 14),
-      padding: const EdgeInsets.fromLTRB(12, 11, 12, 11),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xffe1ddd4)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            title,
-            style: const TextStyle(
-              fontSize: 14.5,
-              fontWeight: FontWeight.w800,
-              letterSpacing: 0.35,
-              color: Color(0xff172554),
-            ),
-          ),
-          const SizedBox(height: 5),
-          Text(
-            text,
-            style: const TextStyle(
-              fontSize: 13.5,
-              height: 1.42,
-              color: Colors.black87,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _ruleFlowNode(String title, String value, {bool active = false}) {
-    return Container(
-      width: 108,
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 9),
-      decoration: BoxDecoration(
-        color: active ? const Color(0xffe9eefc) : Colors.white,
-        borderRadius: BorderRadius.circular(11),
-        border: Border.all(
-          color: active ? const Color(0xff172554) : const Color(0xffd7d2c8),
-          width: active ? 1.8 : 1,
-        ),
-      ),
-      child: Column(
-        children: [
-          Text(title, textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 10.5, fontWeight: FontWeight.w700)),
-          const SizedBox(height: 3),
-          Text(value, textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w800)),
-        ],
-      ),
-    );
-  }
-
-  Widget _ruleArrow() {
-    return const Padding(
-      padding: EdgeInsets.symmetric(horizontal: 6),
-      child: Icon(Icons.arrow_forward_rounded, size: 20, color: Color(0xff6b7280)),
-    );
-  }
-
-  Widget _ruleCheck(String text, {bool good = true}) {
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 4),
-      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
-      decoration: BoxDecoration(
-        color: good ? const Color(0xffeaf7ee) : const Color(0xffffeeee),
-        borderRadius: BorderRadius.circular(9),
-        border: Border.all(
-          color: good ? const Color(0xff9ac9a5) : const Color(0xffe1aaaa),
-        ),
-      ),
-      child: Text(
-        '${good ? '✓' : '✗'} $text',
-        style: TextStyle(
-          fontSize: 11.5,
-          fontWeight: FontWeight.w800,
-          color: good ? const Color(0xff245b32) : const Color(0xff8b2020),
-        ),
+  Widget _ruleArrow({bool down = false}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 3),
+      child: Icon(
+        down ? Icons.arrow_downward_rounded : Icons.arrow_forward_rounded,
+        size: 20,
+        color: const Color(0xff2e7d32),
       ),
     );
   }
@@ -10109,33 +10614,50 @@ CardModel chooseBotCard(
       context: context,
       builder: (dialogContext) {
         return Dialog(
-          insetPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 18),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          backgroundColor: const Color(0xfff5f0e4),
+          insetPadding: const EdgeInsets.symmetric(horizontal: 9, vertical: 12),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
           child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 700, maxHeight: 780),
+            constraints: const BoxConstraints(maxWidth: 720, maxHeight: 850),
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 15, 16, 10),
+              padding: const EdgeInsets.fromLTRB(10, 10, 10, 8),
               child: Column(
                 children: [
                   Container(
-                    padding: const EdgeInsets.fromLTRB(13, 12, 9, 12),
+                    padding: const EdgeInsets.fromLTRB(14, 13, 8, 13),
                     decoration: BoxDecoration(
-                      color: const Color(0xff172554),
-                      borderRadius: BorderRadius.circular(15),
+                      gradient: const LinearGradient(
+                        colors: [Color(0xff123f31), Color(0xff1d6049)],
+                      ),
+                      borderRadius: BorderRadius.circular(17),
+                      border: Border.all(color: const Color(0xffb58b2a), width: 1.2),
                     ),
                     child: Row(
                       children: [
-                        const Icon(Icons.menu_book_rounded, color: Colors.white, size: 25),
-                        const SizedBox(width: 10),
+                        const Icon(Icons.menu_book_rounded, color: Color(0xffffe7a3), size: 27),
+                        const SizedBox(width: 9),
                         const Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Text('BREY RULE BOOK',
-                                  style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w800)),
+                              Text(
+                                'BREY — GAME RULES',
+                                style: TextStyle(
+                                  color: Color(0xffffe7a3),
+                                  fontSize: 19,
+                                  fontWeight: FontWeight.w900,
+                                  letterSpacing: 0.7,
+                                ),
+                              ),
                               SizedBox(height: 2),
-                              Text('Visual guide • rules first • examples',
-                                  style: TextStyle(color: Color(0xffdbe5ff), fontSize: 11.5)),
+                              Text(
+                                'Quick • Clear • Visual',
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
                             ],
                           ),
                         ),
@@ -10147,480 +10669,205 @@ CardModel chooseBotCard(
                       ],
                     ),
                   ),
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 8),
                   Expanded(
                     child: ListView(
+                      padding: const EdgeInsets.only(top: 2, bottom: 3),
                       children: [
-                        _ruleSection(
-                          '1. OBJECTIVE',
-                          'BREY is a 4-player penalty card game. The game is won by the player or players with the lowest cumulative score when the game ends. A score of 100 or more triggers game end only after the required Hand/Round scoring has been completed.',
-                        ),
-
-                        _ruleVisual(
-                          icon: Icons.groups_rounded,
-                          title: '🃏 BASIC 4-PLAYER SETUP & CARD FLOW',
-                          explanation: '13 cards each → 4-card exchange → 13 Hands → Round scoring → next Round if the game has not ended.',
-                          children: [
-                            _ruleFlowNode('PLAYER 1', '13 cards'),
-                            _ruleArrow(),
-                            _ruleFlowNode('PLAYER 2', '13 cards'),
-                            _ruleArrow(),
-                            _ruleFlowNode('PLAYER 3', '13 cards'),
-                            _ruleArrow(),
-                            _ruleFlowNode('PLAYER 4', '13 cards'),
+                        _ruleVisualSection(
+                          number: '1',
+                          title: 'Quick Objective',
+                          icon: Icons.flag_rounded,
+                          visual: [
+                            _ruleCard('10', '♥'),
+                            _ruleCard('J', '♦'),
+                            _ruleCard('K', '♣'),
+                            _ruleCard('Q', '♠', highlighted: true),
                           ],
+                          explanation: 'Collect as few penalty points as possible. The game ends at 100+ points; the lowest final score wins.',
                         ),
-
-                        _ruleVisual(
-                          title: 'THE 52-CARD DECK',
-                          explanation: 'Four suits. Card strength within a suit is 2 < 3 < … < 10 < J < Q < K < A. There is no trump suit.',
-                          children: [
-                            _ruleCardVisual(rank: '7', suit: 'Hearts'),
-                            _ruleCardVisual(rank: 'J', suit: 'Diamonds'),
-                            _ruleCardVisual(rank: 'K', suit: 'Clubs'),
-                            _ruleCardVisual(rank: 'Q', suit: 'Spades'),
-                          ],
-                        ),
-
-                        _ruleVisual(
+                        _ruleVisualSection(
+                          number: '2',
+                          title: 'Exchange 4 Cards',
                           icon: Icons.swap_horiz_rounded,
-                          title: '🔄 4-CARD EXCHANGE',
-                          explanation: 'Every player selects exactly 4 cards. Pass them to the LEFT and receive 4 cards from the RIGHT. All selected cards must come from your original hand.',
-                          children: [
-                            _ruleFlowNode('YOUR HAND', '13 cards', active: true),
+                          visual: [
+                            const Icon(Icons.person_rounded, size: 27, color: Color(0xff172554)),
                             _ruleArrow(),
-                            _ruleFlowNode('PASS LEFT', '4 cards'),
+                            _ruleCard('4', '♣'),
+                            _ruleCard('7', '♦'),
+                            _ruleCard('J', '♥'),
+                            _ruleCard('Q', '♠'),
                             _ruleArrow(),
-                            _ruleFlowNode('RECEIVE RIGHT', '4 cards'),
+                            const Text('LEFT', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w900, color: Color(0xff2e7d32))),
+                          ],
+                          explanation: 'Choose exactly 4 cards from your original 13-card hand and pass them to your LEFT. If you pass ♠Q while another original ♠ remains, pass at least one more ♠. If ♠Q is your only ♠, the other 3 cards may be any cards.',
+                        ),
+                        _ruleVisualSection(
+                          number: '3',
+                          title: 'Hand 1 Is Special',
+                          icon: Icons.looks_one_rounded,
+                          visual: [
+                            _ruleCard('7', '♣', highlighted: true),
+                            _ruleCard('4', '♦', highlighted: true),
+                            _ruleBadge('SAFE LEAD'),
+                            _ruleBadge('♠Q', good: false),
+                          ],
+                          explanation: 'The leader must lead a non-penalty ♣ or ♦ when available. If none is available, any card except ♠Q may lead. If you cannot follow suit, play a non-penalty card when possible; otherwise play any legal card except ♠Q.',
+                        ),
+                        _ruleVisualSection(
+                          number: '4',
+                          title: 'Follow Suit + ♠Q Rule',
+                          icon: Icons.rule_rounded,
+                          visual: [
+                            _ruleCard('7', '♥', highlighted: true),
                             _ruleArrow(),
-                            _ruleFlowNode('NEW HAND', '13 cards', active: true),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '♠Q EXCHANGE — VISUAL CHECK',
-                          explanation: 'If ♠Q is passed while another Spade remains in the original hand, at least one more Spade must be passed. If ♠Q is the only Spade, it may be passed with any other 3 cards.',
-                          children: [
-                            _ruleCardVisual(rank: 'Q', suit: 'Spades', highlighted: true),
-                            _ruleCardVisual(rank: '6', suit: 'Spades', highlighted: true),
-                            const SizedBox(width: 5),
-                            _ruleCheck('Q♠ + another ♠ = legal'),
-                            const SizedBox(width: 7),
-                            _ruleCardVisual(rank: 'Q', suit: 'Spades', highlighted: true),
-                            const SizedBox(width: 5),
-                            _ruleCheck('Q♠ alone + 3 others = legal if it is the only ♠'),
-                          ],
-                        ),
-
-                        _ruleSection(
-                          '2. PENALTY CARDS & SCORING VALUES',
-                          'Every ♥ = 1 point. ♦J = 4 points. ♣K = 6 points. ♠Q = 12 points when it is scored normally. All other cards = 0 points. The complete deck contains 35 penalty points.',
-                        ),
-
-                        _ruleVisual(
-                          icon: Icons.whatshot_rounded,
-                          title: '💥 PENALTY CARDS',
-                          explanation: 'Penalty points are collected by the player who wins the Hand containing those cards.',
-                          children: [
-                            _ruleCardVisual(rank: '5', suit: 'Hearts', highlighted: true),
-                            const Text(' = 1', style: TextStyle(fontWeight: FontWeight.w800)),
-                            const SizedBox(width: 10),
-                            _ruleCardVisual(rank: 'J', suit: 'Diamonds', highlighted: true),
-                            const Text(' = 4', style: TextStyle(fontWeight: FontWeight.w800)),
-                            const SizedBox(width: 10),
-                            _ruleCardVisual(rank: 'K', suit: 'Clubs', highlighted: true),
-                            const Text(' = 6', style: TextStyle(fontWeight: FontWeight.w800)),
-                            const SizedBox(width: 10),
-                            _ruleCardVisual(rank: 'Q', suit: 'Spades', highlighted: true),
-                            const Text(' = 12', style: TextStyle(fontWeight: FontWeight.w800)),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '♣♦ HAND 1 OPENING RULE',
-                          explanation: 'At the start of Hand 1 of EVERY Round, if the leader has any non-penalty ♣ or ♦, one of those cards must be led.',
-                          children: [
-                            _ruleCardVisual(rank: '7', suit: 'Clubs', highlighted: true),
-                            _ruleCardVisual(rank: '4', suit: 'Diamonds', highlighted: true),
-                            const Text('  →  choose a safe ♣/♦ lead', style: TextStyle(fontWeight: FontWeight.w800)),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '🚫 ♠Q RESTRICTION IN HAND 1',
-                          explanation: '♠Q cannot be led in Hand 1. More generally, when Hand 1 requires a non-penalty card and a legal non-penalty option exists, a penalty card cannot be chosen instead.',
-                          children: [
-                            _ruleCardVisual(rank: 'Q', suit: 'Spades', muted: true),
-                            _ruleCheck('♠Q as Hand-1 lead', good: false),
-                            const SizedBox(width: 6),
-                            _ruleCardVisual(rank: '8', suit: 'Clubs', highlighted: true),
-                            _ruleCheck('safe alternative', good: true),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          icon: Icons.style_rounded,
-                          title: '🃏 FOLLOWING SUIT',
-                          explanation: 'The first card sets the led suit. If you have that suit, you MUST follow it. You cannot choose a different suit while a legal led-suit card exists.',
-                          children: [
-                            _ruleCardVisual(rank: '8', suit: 'Diamonds', highlighted: true),
+                            _ruleCard('K', '♥', highlighted: true),
+                            _ruleBadge('MUST FOLLOW'),
                             _ruleArrow(),
-                            _ruleCardVisual(rank: 'K', suit: 'Diamonds', highlighted: true),
-                            _ruleCheck('legal follow'),
-                            const SizedBox(width: 5),
-                            _ruleCardVisual(rank: 'A', suit: 'Spades'),
-                            _ruleCheck('illegal while ♦ exists', good: false),
+                            _ruleCard('Q', '♠', highlighted: true),
                           ],
+                          explanation: 'If you have the led suit, you MUST follow it. In Hands 2–13, if you are void in the led suit and hold ♠Q, you MUST play ♠Q. Otherwise, any legal discard may be played.',
                         ),
-
-                        _ruleVisual(
-                          title: '♠Q — VOID-IN-SUIT RULE',
-                          explanation: 'In Hands 2–13, if you are void in the led suit and hold ♠Q, ♠Q MUST be played. There is no optional Q choice and no old Q lock.',
-                          children: [
-                            _ruleCardVisual(rank: '9', suit: 'Hearts'),
-                            _ruleArrow(),
-                            const Text('You have no ♥', style: TextStyle(fontWeight: FontWeight.w800)),
-                            _ruleArrow(),
-                            _ruleCardVisual(rank: 'Q', suit: 'Spades', highlighted: true),
-                            _ruleCheck('MUST PLAY', good: true),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: 'HAND 1 VOID CASE',
-                          explanation: 'If Hand 1 is being followed and you cannot follow the led suit, play a non-penalty card when one is legally available. If no non-penalty option exists, the remaining legal card(s) may be used; ♠Q is never a Hand-1 play when a legal non-penalty choice exists.',
-                          children: [
-                            _ruleCardVisual(rank: '9', suit: 'Hearts'),
-                            _ruleArrow(),
-                            _ruleCardVisual(rank: '7', suit: 'Clubs', highlighted: true),
-                            _ruleCheck('choose non-penalty'),
-                            const SizedBox(width: 5),
-                            _ruleCardVisual(rank: 'J', suit: 'Diamonds'),
-                            _ruleCheck('penalty — avoid if safe option exists', good: false),
-                          ],
-                        ),
-
-                        _ruleVisual(
+                        _ruleVisualSection(
+                          number: '5',
+                          title: 'Who Wins the Hand?',
                           icon: Icons.emoji_events_rounded,
-                          title: '👑 HOW A HAND WINNER IS DETERMINED',
-                          explanation: 'The highest card of the led suit wins. Off-suit cards never beat a led-suit card because there is no trump suit. The winner leads the next Hand.',
-                          children: [
-                            _ruleCardVisual(rank: '8', suit: 'Hearts'),
-                            _ruleCardVisual(rank: 'K', suit: 'Hearts', highlighted: true),
-                            _ruleCardVisual(rank: 'A', suit: 'Spades'),
-                            _ruleCardVisual(rank: 'J', suit: 'Clubs'),
-                            const SizedBox(width: 8),
-                            const Text('→ K♥ wins', style: TextStyle(fontWeight: FontWeight.w900)),
+                          visual: [
+                            _ruleCard('4', '♠'),
+                            _ruleCard('9', '♠'),
+                            _ruleCard('Q', '♠', highlighted: true),
+                            _ruleArrow(),
+                            const Icon(Icons.emoji_events_rounded, size: 28, color: Color(0xffb58b2a)),
                           ],
+                          explanation: 'The highest card of the led suit wins the Hand. The winner takes all 4 played cards and their penalty points, then leads the next Hand.',
                         ),
-
-                        _ruleVisual(
-                          title: '🔁 PENALTY TRANSFER — EXAMPLE 1',
-                          explanation: '♦ is led. A player is void in ♦ and holds ♠Q. In Hands 2–13, that player must discard ♠Q. The Hand winner collects the ♠Q penalty.',
-                          children: [
-                            _ruleCardVisual(rank: '9', suit: 'Diamonds'),
-                            _ruleArrow(),
-                            _ruleCardVisual(rank: 'Q', suit: 'Spades', highlighted: true),
-                            _ruleArrow(),
-                            const Text('Hand winner\ncollects ♠Q', textAlign: TextAlign.center,
-                                style: TextStyle(fontWeight: FontWeight.w800)),
+                        _ruleVisualSection(
+                          number: '6',
+                          title: 'Know the Penalty Cards',
+                          icon: Icons.warning_amber_rounded,
+                          visual: [
+                            _ruleCard('J', '♦'),
+                            const Text('4', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w900)),
+                            _ruleCard('K', '♣'),
+                            const Text('6', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w900)),
+                            _ruleCard('Q', '♠'),
+                            const Text('12', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w900)),
+                            _ruleCard('2', '♥'),
+                            const Text('1 each', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w900)),
                           ],
+                          explanation: 'Current BREY scoring: ♦J = 4 points, ♣K = 6 points, ♠Q = 12 points normally, and each ♥ = 1 point. If the game protects/scores ♠Q as 0, it contributes 0.',
                         ),
-
-                        _ruleVisual(
-                          title: '🔁 PENALTY TRANSFER — EXAMPLE 2',
-                          explanation: 'When you cannot follow suit and ♠Q is not in your hand, another penalty card may be discarded under the normal legality rules. The winner receives the penalties in the Hand.',
-                          children: [
-                            _ruleCardVisual(rank: '7', suit: 'Clubs'),
+                        _ruleVisualSection(
+                          number: '7',
+                          title: 'Two-Hand Lead Limit',
+                          icon: Icons.block_rounded,
+                          visual: [
+                            _ruleCard('5', '♦', highlighted: true),
                             _ruleArrow(),
-                            _ruleCardVisual(rank: 'J', suit: 'Diamonds', highlighted: true),
+                            _ruleCard('K', '♦', highlighted: true),
                             _ruleArrow(),
-                            const Text('Winner collects\n♦J = 4 points', textAlign: TextAlign.center,
-                                style: TextStyle(fontWeight: FontWeight.w800)),
+                            _ruleCard('7', '♦'),
+                            const SizedBox(width: 4),
+                            _ruleBadge('BLOCKED NEXT', good: false),
                           ],
+                          explanation: 'If the same suit is led in two consecutive Hands, that suit cannot be led in the next Hand when another legal lead exists. If ♠Q has already been played in the Round, this restriction ends for the rest of that Round.',
                         ),
-
-                        _ruleVisual(
-                          title: '♠Q COLLECTION — NORMAL',
-                          explanation: 'If the Hand winner had less than 88 points BEFORE the Hand was scored, a collected ♠Q contributes 12 points.',
-                          children: [
-                            _ruleFlowNode('WINNER SCORE BEFORE', '70'),
-                            _ruleArrow(),
-                            _ruleCardVisual(rank: 'Q', suit: 'Spades', highlighted: true),
-                            _ruleArrow(),
-                            _ruleFlowNode('Q SCORE', '+12', active: true),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '♠Q COLLECTION — PROTECTED',
-                          explanation: 'If the Hand winner had 88–99 points BEFORE the Hand was scored, ♠Q contributes 0 points. Other penalty cards in that Hand still count.',
-                          children: [
-                            _ruleFlowNode('WINNER SCORE BEFORE', '92'),
-                            _ruleArrow(),
-                            _ruleCardVisual(rank: 'Q', suit: 'Spades', highlighted: true),
-                            _ruleArrow(),
-                            _ruleFlowNode('Q SCORE', '0', active: true),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '🔒 TWO-CONSECUTIVE-LEAD RESTRICTION',
-                          explanation: 'Before ♠Q is played, the same suit may be led in at most two consecutive Hands. A different lead resets the sequence. If the blocked suit is the leader’s ONLY legally available lead, the emergency override allows it.',
-                          children: [
-                            _ruleFlowNode('HAND 3', '♥ lead', active: true),
-                            _ruleArrow(),
-                            _ruleFlowNode('HAND 4', '♥ lead', active: true),
-                            _ruleArrow(),
-                            _ruleFlowNode('HAND 5', '♥ blocked', active: false),
-                            _ruleArrow(),
-                            _ruleFlowNode('EXCEPTION', 'only legal lead'),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '🔓 AFTER ♠Q IS PLAYED',
-                          explanation: 'Once ♠Q has been played in the current Round, the two-consecutive-lead restriction disappears for the rest of that Round.',
-                          children: [
-                            _ruleCardVisual(rank: 'Q', suit: 'Spades', highlighted: true),
-                            _ruleArrow(),
-                            _ruleFlowNode('LEAD RULE', 'unlocked', active: true),
-                            _ruleArrow(),
-                            _ruleFlowNode('REST OF ROUND', 'free leads'),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          icon: Icons.track_changes_rounded,
-                          title: '🎯 35-POINT CANCELLATION',
-                          explanation: 'At the end of a complete 13-Hand Round, if the actual scored Round penalty total is exactly 35 for one player, all 35 are cancelled. This is a Round-level rule, not a single-Hand rule.',
-                          children: [
-                            _ruleFlowNode('ROUND PENALTIES', '35'),
-                            _ruleArrow(),
-                            _ruleFlowNode('CANCEL', '−35', active: true),
-                            _ruleArrow(),
-                            _ruleFlowNode('SCORED FROM POOL', '0'),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '35-POINT RULE — IMPORTANT Q EXAMPLE',
-                          explanation: 'If ♠Q is protected and scores 0, collecting every penalty card produces only 23 actual scored points from the Round. Therefore the exact-35 cancellation does NOT trigger.',
-                          children: [
-                            _ruleCardVisual(rank: 'Q', suit: 'Spades', muted: true),
-                            const Text('0', style: TextStyle(fontWeight: FontWeight.w900)),
-                            const SizedBox(width: 8),
-                            const Text('+ 23 other penalty points', style: TextStyle(fontWeight: FontWeight.w800)),
-                            _ruleArrow(),
-                            _ruleFlowNode('ACTUAL ROUND SCORE', '23'),
-                            _ruleArrow(),
-                            _ruleCheck('no 35-cancel', good: false),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '🏆 ZERO-HAND −5 RULE',
-                          explanation: 'Only after all 13 Hands are complete: a player who won 0 Hands gets 5 points removed. The score is clamped at 0.',
-                          children: [
-                            _ruleFlowNode('HANDS WON', '0'),
-                            _ruleArrow(),
-                            _ruleFlowNode('ADJUSTMENT', '−5', active: true),
-                            _ruleArrow(),
-                            _ruleFlowNode('SCORE', 'min 0'),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '🔢 100-POINT GAME-END RULE',
-                          explanation: 'A score reaching 100 or more triggers game end after the relevant scoring stage. Hands 1–12 may trigger it immediately after Hand scoring. Hand 13 must complete full Round-end processing first.',
-                          children: [
-                            _ruleFlowNode('SCORE', '100+ ', active: true),
-                            _ruleArrow(),
-                            _ruleFlowNode('TRIGGER', 'game end'),
-                            _ruleArrow(),
-                            _ruleFlowNode('WINNER TEST', 'lowest score'),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          icon: Icons.sync_rounded,
-                          title: '🔄 ROUND TRANSITION',
-                          explanation: 'After Hand 13, finish all Round-end scoring first. If the game continues, reset the Round state, deal a fresh 52-card Round, and begin Hand 1 again.',
-                          children: [
-                            _ruleFlowNode('HAND 13', 'finish'),
-                            _ruleArrow(),
-                            _ruleFlowNode('ROUND SCORING', '35 / −5'),
-                            _ruleArrow(),
-                            _ruleFlowNode('RESET', 'Round state'),
-                            _ruleArrow(),
-                            _ruleFlowNode('NEW ROUND', 'Hand 1', active: true),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '👑 ♠Q COLLECTOR → NEXT DEALER',
-                          explanation: 'The player who collects ♠Q is recorded during the Round. If another Round starts, that ♠Q collector becomes the dealer for the next Round.',
-                          children: [
-                            _ruleCardVisual(rank: 'Q', suit: 'Spades', highlighted: true),
-                            _ruleArrow(),
-                            _ruleFlowNode('COLLECTOR', 'recorded', active: true),
-                            _ruleArrow(),
-                            _ruleFlowNode('NEXT ROUND', 'dealer'),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          icon: Icons.psychology_rounded,
-                          title: '🧠 BOT DECISION / LEGALITY FLOW',
-                          explanation: 'The BOT never chooses from illegal cards. BREY rules are applied first; strategy operates only on the legal set; a final legality check happens before the card is played.',
-                          children: [
-                            _ruleFlowNode('BOT HAND', '13 cards'),
-                            _ruleArrow(),
-                            _ruleFlowNode('CHECK RULES', 'all rules', active: true),
-                            _ruleArrow(),
-                            _ruleFlowNode('LEGAL SET', 'only legal'),
-                            _ruleArrow(),
-                            _ruleFlowNode('STRATEGY', 'evaluate'),
-                            _ruleArrow(),
-                            _ruleFlowNode('FINAL CHECK', 'play'),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '❌ ILLEGAL vs LEGAL — FOLLOW SUIT',
-                          explanation: '♦ is led and the player has ♦K. Playing ♠A is illegal because a legal ♦ follow exists. ♦K is legal.',
-                          children: [
-                            _ruleCardVisual(rank: '9', suit: 'Diamonds', highlighted: true),
-                            _ruleArrow(),
-                            _ruleCardVisual(rank: 'K', suit: 'Diamonds', highlighted: true),
-                            _ruleCheck('LEGAL'),
-                            const SizedBox(width: 7),
-                            _ruleCardVisual(rank: 'A', suit: 'Spades'),
-                            _ruleCheck('ILLEGAL', good: false),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '❌ ILLEGAL vs LEGAL — ♠Q WHEN VOID',
-                          explanation: 'In Hands 2–13, if you are void in the led suit and hold ♠Q, choosing another discard instead of ♠Q is illegal.',
-                          children: [
-                            _ruleCardVisual(rank: '8', suit: 'Clubs'),
-                            _ruleArrow(),
-                            _ruleCardVisual(rank: 'Q', suit: 'Spades', highlighted: true),
-                            _ruleCheck('LEGAL / REQUIRED'),
-                            const SizedBox(width: 7),
-                            _ruleCardVisual(rank: 'J', suit: 'Diamonds'),
-                            _ruleCheck('ILLEGAL instead', good: false),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '❌ ILLEGAL vs LEGAL — HAND 1 LEAD',
-                          explanation: 'If the Hand-1 leader has a non-penalty ♣ or ♦, a penalty lead such as ♣K, ♦J, ♥ or ♠Q is not allowed when a safe legal ♣/♦ lead exists.',
-                          children: [
-                            _ruleCardVisual(rank: '6', suit: 'Clubs', highlighted: true),
-                            _ruleCheck('LEGAL LEAD'),
-                            const SizedBox(width: 6),
-                            _ruleCardVisual(rank: 'K', suit: 'Clubs'),
-                            _ruleCheck('PENALTY LEAD — ILLEGAL', good: false),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          icon: Icons.check_circle_rounded,
-                          title: '✅ COMPLETE EXAMPLE HAND',
-                          explanation: '♥ is led. Every player follows ♥ when able. The highest ♥ is K♥, so that player wins the Hand and collects any penalties in the four-card Hand.',
-                          children: [
-                            _ruleCardVisual(rank: '7', suit: 'Hearts'),
-                            _ruleCardVisual(rank: 'K', suit: 'Hearts', highlighted: true),
-                            _ruleCardVisual(rank: '10', suit: 'Hearts'),
-                            _ruleCardVisual(rank: '3', suit: 'Hearts'),
-                            _ruleArrow(),
-                            const Text('K♥ = WINNER', style: TextStyle(fontWeight: FontWeight.w900)),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: 'COMPLETE EXAMPLE HAND — PENALTY INCLUDED',
-                          explanation: '♣ is led. One player is void in ♣ and discards ♦J. If K♣ wins the Hand, the K♣ player collects ♦J = 4 points plus any other penalties in that Hand.',
-                          children: [
-                            _ruleCardVisual(rank: '8', suit: 'Clubs'),
-                            _ruleCardVisual(rank: 'K', suit: 'Clubs', highlighted: true),
-                            _ruleCardVisual(rank: 'J', suit: 'Diamonds', highlighted: true),
-                            _ruleCardVisual(rank: '4', suit: 'Clubs'),
-                            _ruleArrow(),
-                            const Text('WINNER → +4', style: TextStyle(fontWeight: FontWeight.w900)),
-                          ],
-                        ),
-
-                        _ruleVisual(
-                          title: '📊 FULL ROUND — HAND 1 → HAND 13',
-                          explanation: 'A Round always contains exactly 13 Hands. Each Hand transfers the lead to its winner. Hand 13 is special because its winner is finalized before the complete Round-end scoring sequence is applied.',
-                          children: List<Widget>.generate(
-                            13,
-                            (index) => Container(
-                              margin: const EdgeInsets.symmetric(horizontal: 2),
-                              width: 42,
-                              height: 42,
-                              alignment: Alignment.center,
+                        _ruleVisualSection(
+                          number: '8',
+                          title: 'Round-End Rules',
+                          icon: Icons.calculate_rounded,
+                          visual: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
                               decoration: BoxDecoration(
-                                color: index == 12
-                                    ? const Color(0xffe9eefc)
-                                    : Colors.white,
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(
-                                  color: index == 12
-                                      ? const Color(0xff172554)
-                                      : const Color(0xffd7d2c8),
-                                ),
+                                color: const Color(0xffffeeee),
+                                borderRadius: BorderRadius.circular(9),
+                                border: Border.all(color: const Color(0xffe1aaaa)),
                               ),
-                              child: Text(
-                                '${index + 1}',
-                                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w800),
-                              ),
+                              child: const Text('35 EXACT → CANCEL', style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w900, color: Color(0xff8b2020))),
                             ),
+                            _ruleArrow(),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                              decoration: BoxDecoration(
+                                color: const Color(0xffeaf7ee),
+                                borderRadius: BorderRadius.circular(9),
+                                border: Border.all(color: const Color(0xff9ac9a5)),
+                              ),
+                              child: const Text('0 HANDS → −5', style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w900, color: Color(0xff245b32))),
+                            ),
+                          ],
+                          explanation: 'After all 13 Hands, if one player has exactly 35 actual Round penalty points, those 35 are cancelled. A player who won 0 Hands gets −5 points. Scores cannot go below 0.',
+                        ),
+                        _ruleVisualSection(
+                          number: '9',
+                          title: 'Next Round & Game End',
+                          icon: Icons.flag_circle_rounded,
+                          visual: [
+                            _ruleCard('Q', '♠', highlighted: true),
+                            _ruleArrow(),
+                            const Icon(Icons.person_rounded, size: 27, color: Color(0xff172554)),
+                            _ruleArrow(),
+                            const Text('NEXT DEALER', style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w900, color: Color(0xff174c3b))),
+                            _ruleArrow(),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                              decoration: BoxDecoration(
+                                color: const Color(0xfff5e8c8),
+                                borderRadius: BorderRadius.circular(9),
+                              ),
+                              child: const Text('100+ → END', style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w900, color: Color(0xff6d4c1f))),
+                            ),
+                          ],
+                          explanation: 'The player who collected ♠Q becomes the next dealer. A score of 100 or more ends the game after the required scoring stage. The player or players with the lowest final cumulative score win.',
+                        ),
+                        Container(
+                          margin: const EdgeInsets.only(bottom: 10),
+                          padding: const EdgeInsets.all(13),
+                          decoration: BoxDecoration(
+                            color: const Color(0xff174c3b),
+                            borderRadius: BorderRadius.circular(15),
+                            border: Border.all(color: const Color(0xffb58b2a), width: 1.2),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Row(
+                                children: [
+                                  Icon(Icons.lightbulb_rounded, color: Color(0xffffe7a3), size: 20),
+                                  SizedBox(width: 7),
+                                  Text('EASY MEMORY', style: TextStyle(color: Color(0xffffe7a3), fontSize: 13.5, fontWeight: FontWeight.w900, letterSpacing: 0.7)),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                              _coloredSuitText(
+                                'FOLLOW SUIT → HAND 1 IS SPECIAL → VOID + ♠Q (HANDS 2–13) = PLAY ♠Q → HIGHEST LED SUIT WINS → WINNER TAKES PENALTIES → EXACT 35 = CANCEL → 0 HANDS = −5 → ♠Q COLLECTOR DEALS NEXT → 100+ ENDS GAME.',
+                                style: const TextStyle(color: Colors.white, fontSize: 11.5, height: 1.45, fontWeight: FontWeight.w700),
+                              ),
+                            ],
                           ),
                         ),
-
-                        _ruleVisual(
-                          title: '🔄 FULL ROUND FLOW',
-                          explanation: 'The complete Round sequence: exchange → Hands 1–13 → Hand 13 winner → actual Round penalties → ♠Q protection/scoring → exact-35 cancellation → zero-Hand −5 → score clamp → next dealer → game-end check → reset/start next Round.',
-                          children: [
-                            _ruleFlowNode('EXCHANGE', '4 cards'),
-                            _ruleArrow(),
-                            _ruleFlowNode('HANDS', '1 → 13'),
-                            _ruleArrow(),
-                            _ruleFlowNode('ROUND END', 'score'),
-                            _ruleArrow(),
-                            _ruleFlowNode('NEXT', 'dealer / game'),
-                          ],
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                          decoration: BoxDecoration(
+                            color: const Color(0xfffff8e8),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: const Color(0xffd9c69a)),
+                          ),
+                          child: const Row(
+                            children: [
+                              Icon(Icons.tips_and_updates_rounded, size: 20, color: Color(0xff8a6a2b)),
+                              SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  'If a card is illegal, the on-screen hint explains the rule you need right now.',
+                                  style: TextStyle(fontSize: 11.5, height: 1.35, fontWeight: FontWeight.w700, color: Color(0xff5f513b)),
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
-
-                        _ruleVisual(
-                          title: '🏁 FINAL SCORING & WINNER DETERMINATION',
-                          explanation: 'After the game-end trigger and all required scoring for that stage, compare cumulative scores. The player or players with the LOWEST cumulative score are the BREY Champion(s). Equal lowest scores produce joint winners.',
-                          children: [
-                            _ruleFlowNode('PLAYER A', '72'),
-                            _ruleFlowNode('PLAYER B', '91'),
-                            _ruleFlowNode('PLAYER C', '72', active: true),
-                            _ruleFlowNode('PLAYER D', '100+'),
-                            const SizedBox(width: 8),
-                            const Text('→ lowest score = Champion(s)', textAlign: TextAlign.center,
-                                style: TextStyle(fontWeight: FontWeight.w900)),
-                          ],
-                        ),
-
-                        _ruleSection(
-                          'ROUND-END ORDER — DO NOT SKIP STEPS',
-                          '1) Finalize the Hand 13 winner. 2) Add Hand 13 actual penalties. 3) Apply ♠Q protection/scoring. 4) Apply the exact-35 cancellation using actual scored Round penalties. 5) Apply the zero-Hand −5 rule. 6) Clamp scores at 0. 7) Identify the ♠Q collector as next dealer. 8) Check whether the game ends. 9 — Reset Round state and start the next Round when required.',
-                        ),
-
-                        _ruleSection(
-                          'QUICK MEMORY CARD',
-                          'FOLLOW SUIT → HAND 1 IS SPECIAL → ♠Q IS FORCED WHEN VOID IN HANDS 2–13 → HIGHEST LED SUIT WINS → ♠Q MAY BE 12 OR 0 → EXACT 35 CAN CANCEL → 0 HANDS = −5 → ♠Q COLLECTOR DEALS NEXT ROUND → 100+ ENDS THE GAME AFTER THE REQUIRED SCORING → LOWEST CUMULATIVE SCORE WINS.',
-                        ),
-
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 5),
                       ],
                     ),
                   ),
@@ -11485,7 +11732,7 @@ CardModel chooseBotCard(
                         title: const Text('Animation Speed'),
                         trailing: SegmentedButton<String>(
                           segments: const [
-                            ButtonSegment<String>(value: 'normal', label: Text('Normal')),
+                            ButtonSegment<String>(value: 'normal', label: Text('Relaxed')),
                             ButtonSegment<String>(value: 'fast', label: Text('Fast')),
                           ],
                           selected: <String>{_animationSpeed},
