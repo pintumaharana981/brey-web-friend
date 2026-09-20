@@ -754,7 +754,7 @@ class _BreyGameState extends State<BreyGame> {
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Text(
+                          _coloredSuitText(
                             title,
                             textAlign: TextAlign.center,
                             style: TextStyle(
@@ -3680,11 +3680,11 @@ class _BreyGameState extends State<BreyGame> {
     // attack philosophy; difficulty changes execution quality, not target.
     switch (botDifficulty) {
       case BotDifficulty.easy:
-        return 2.00;
+        return 8.00;
       case BotDifficulty.medium:
-        return 2.40;
+        return 12.00;
       case BotDifficulty.hard:
-        return 5.50;
+        return 20.00;
     }
   }
 
@@ -4377,7 +4377,7 @@ class _BreyGameState extends State<BreyGame> {
     required bool leading,
     required bool winning,
   }) {
-    if (botDifficulty != BotDifficulty.hard || botIndex == 0) return 0.0;
+    if (botIndex == 0) return 0.0;
 
     const int humanIndex = 0;
     final int humanScore = players[humanIndex].score;
@@ -4438,6 +4438,22 @@ class _BreyGameState extends State<BreyGame> {
       leading: leading,
       winning: winning,
     );
+
+    // UNIVERSAL HUMAN-PRESSURE BOOST: all BOT levels prioritize legal
+    // decisions that reduce the human's chance of winning. This is still
+    // scored through the normal strategic pipeline; no hidden cards are read.
+    if (botIndex != 0) {
+      final int humanScore = players[0].score;
+      final bool humanWinningHand = determineCurrentWinner() == 0;
+      final double loadedHand = currentHandPenaltyTotal();
+      if (humanWinningHand && loadedHand > 0) {
+        score += 5000.0 + loadedHand * 500.0;
+        if (candidate.penalty > 0) score += candidate.penalty * 500.0;
+      }
+      if (humanScore >= 0) {
+        score += humanScore * 8.0;
+      }
+    }
 
     // PRIMARY TARGET — human player (index 0).
     // This is intentionally stronger than generic opponent pressure.
@@ -9503,7 +9519,7 @@ CardModel chooseBotCard(
 
                           const SizedBox(height: 7),
 
-                          const Text(
+                          _coloredSuitText(
                             '♠Q: If you pass ♠Q while another Spade remains in your hand, select at least one more Spade with it.',
                             textAlign: TextAlign.center,
                             style: TextStyle(
@@ -9644,7 +9660,7 @@ CardModel chooseBotCard(
               ),
             ),
             const SizedBox(height: 9),
-            const Text(
+            _coloredSuitText(
               '♠Q rule: If you pass ♠Q and have another Spade, you must pass at least one other Spade with it.',
               textAlign: TextAlign.center,
               style: TextStyle(
@@ -10059,12 +10075,11 @@ CardModel chooseBotCard(
             ),
           const SizedBox(height: 4),
           if (ledSuit != null)
-            Text(
+            _coloredSuitText(
               'LED  $ledSymbol',
-              style: TextStyle(
-                color: ledSuit == 'Hearts' || ledSuit == 'Diamonds'
-                    ? const Color(0xffff9da8)
-                    : const Color(0xfff2efe5),
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Color(0xfff2efe5),
                 fontSize: 11,
                 fontWeight: FontWeight.w800,
                 letterSpacing: 0.8,
@@ -10239,10 +10254,9 @@ CardModel chooseBotCard(
 
             return Padding(
               padding: const EdgeInsets.symmetric(vertical: 3),
-              child: Text(
+              child: _coloredSuitText(
                 'H${index + 1}  •  $cards  •  $winnerName won  •  ${penalty == 0 ? '0' : '+$penalty'} pts',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.left,
                 style: const TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w600,
@@ -12030,9 +12044,10 @@ CardModel chooseBotCard(
 
                       const Spacer(),
 
-                      const Text(
+                      _coloredSuitText(
                         '♠   ♥   ♦   ♣',
-                        style: TextStyle(
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
                           fontSize: 25,
                           letterSpacing: 5,
                           color: Color(0xffa47b24),
