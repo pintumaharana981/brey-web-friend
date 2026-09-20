@@ -358,6 +358,7 @@ class _BreyGameState extends State<BreyGame> {
   bool _botTurnScheduled = false;
   int _botRecoveryAttempts = 0;
 
+
   // Selected BOT difficulty. The UI intentionally shows only the
   // difficulty names; the strength calibration is kept internal.
   BotDifficulty botDifficulty = BotDifficulty.medium;
@@ -2081,21 +2082,41 @@ class _BreyGameState extends State<BreyGame> {
   List<CardModel> legalLeadCardsIgnoringGlobalBlock(int playerIndex) {
     final Player player = players[playerIndex];
 
-    if (handNumber == 1) {
-      final List<CardModel> safeClubsDiamonds = player.cards.where((card) {
-        return (card.suit == 'Clubs' || card.suit == 'Diamonds') &&
-            card.penalty == 0 &&
-            !card.isSpadeQueen;
-      }).toList();
+if (handNumber == 1) {
+  // FIRST-HAND PENALTY-HAND EXCEPTION:
+  // If every card in the player's hand carries a penalty,
+  // any Diamond or Club may be led, including ♦J / ♣K.
+  final bool everyCardCarriesPenalty =
+      player.cards.isNotEmpty &&
+      player.cards.every((card) => card.penalty > 0);
 
-      if (safeClubsDiamonds.isNotEmpty) {
-        return safeClubsDiamonds;
-      }
+  if (everyCardCarriesPenalty) {
+    final List<CardModel> penaltyClubsDiamonds =
+        player.cards.where((card) {
+      return (card.suit == 'Clubs' || card.suit == 'Diamonds') &&
+          !card.isSpadeQueen;
+    }).toList();
 
-      return player.cards
-          .where((card) => !card.isSpadeQueen)
-          .toList();
+    if (penaltyClubsDiamonds.isNotEmpty) {
+      return penaltyClubsDiamonds;
     }
+  }
+
+  final List<CardModel> safeClubsDiamonds =
+      player.cards.where((card) {
+    return (card.suit == 'Clubs' || card.suit == 'Diamonds') &&
+        card.penalty == 0 &&
+        !card.isSpadeQueen;
+  }).toList();
+
+  if (safeClubsDiamonds.isNotEmpty) {
+    return safeClubsDiamonds;
+  }
+
+  return player.cards
+      .where((card) => !card.isSpadeQueen)
+      .toList();
+}
 
     // Hands 2–13: every card is a possible lead, subject only to the
     // global two-consecutive-lead restriction checked separately.
@@ -4953,6 +4974,136 @@ class _BreyGameState extends State<BreyGame> {
 // BOT 1 -> BOT 2 -> BOT 3 -> YOU.
 // This direction is part of the BREY rules, not a visual/UI convention.
 
+  // ==========================================================
+  // 200% ATTACK / SELF-PRESERVATION ARBITER
+  // ==========================================================
+  // Additive pressure layer. Existing probability, card-counting, opponent
+  // model, look-ahead and BREY-specific engines remain authoritative.
+  double scoreAttack200(
+    int botIndex,
+    CardModel candidate, {
+    required bool winning,
+    bool leading = false,
+  }) {
+    final Player bot = players[botIndex];
+    final int currentWinner = determineCurrentWinner();
+    final double visiblePenalty = currentHandPenaltyTotal();
+    double score = 0.0;
+
+    // ♠Q is never a casual play. Existing specialised Queen logic can still
+    // overcome this when there is a genuine tactical reason.
+    if (candidate.isSpadeQueen) {
+      score += winning ? -260.0 : -420.0;
+      if (currentWinner >= 0 && currentWinner != botIndex) {
+        final int targetScore = players[currentWinner].score;
+        if (targetScore >= 94 && winning) {
+          score += 150.0;
+        } else if (targetScore >= 88 && winning) {
+          score += 90.0;
+        }
+      }
+    }
+
+    // Avoid collecting a loaded Hand unless existing strategy finds a strong
+    // reason to take it.
+    if (winning) {
+      if (visiblePenalty >= 8) {
+        score -= 180.0;
+      } else if (visiblePenalty >= 4) {
+        score -= 90.0;
+      } else if (visiblePenalty > 0) {
+        score -= 30.0;
+      }
+    } else if (visiblePenalty >= 8) {
+      score += 80.0;
+    } else if (visiblePenalty >= 4) {
+      score += 45.0;
+    }
+
+    // Attack opponents close to 100 when we can safely route the Hand to them.
+    if (currentWinner >= 0 && currentWinner != botIndex) {
+      final int targetScore = players[currentWinner].score;
+      if (targetScore >= 94) {
+        if (!winning) {
+          score += 100.0 + candidate.penalty * 24.0;
+        } else if (visiblePenalty == 0) {
+          score += 55.0;
+        } else {
+          score += visiblePenalty * 16.0;
+        }
+      } else if (targetScore >= 88) {
+        if (!winning) {
+          score += 55.0 + candidate.penalty * 13.0;
+        } else if (visiblePenalty == 0) {
+          score += 28.0;
+        }
+      }
+    }
+
+    // Attack confirmed voids of dangerous opponents when leading.
+    if (leading) {
+      int dangerousVoids = 0;
+      for (int opponent = 0; opponent < 4; opponent++) {
+        if (opponent == botIndex) continue;
+        if (!voidSuitsByPlayer[opponent].contains(candidate.suit)) continue;
+        final int targetScore = players[opponent].score;
+        if (targetScore >= 94) {
+          dangerousVoids += 2;
+        } else if (targetScore >= 88) {
+          dangerousVoids += 1;
+        }
+      }
+      score += dangerousVoids * 38.0;
+      if (dangerousVoids > 0 && candidate.penalty == 0) {
+        score += 24.0;
+      }
+    }
+
+    // Create future voids without blindly sacrificing a major penalty.
+    final int candidateSuitCount = bot.cards
+        .where((card) => card.suit == candidate.suit)
+        .length;
+    if (candidateSuitCount == 1) {
+      score += 32.0;
+    } else if (candidateSuitCount == 2) {
+      score += 12.0;
+    }
+
+    // Safe low cards are excellent exits.
+    if (candidate.penalty == 0 && candidate.value <= 7) {
+      score += winning ? 10.0 : 36.0;
+    }
+
+    if (winning && visiblePenalty == 0) {
+      score += 42.0;
+    }
+
+    // Direct penalty avoidance; specialised transfer/capture layers can still
+    // overcome this when they identify a real tactical opportunity.
+    if (candidate.penalty == 0) {
+      score += 28.0;
+    } else {
+      score -= candidate.penalty * 18.0;
+    }
+
+    // Stronger self-preservation in the endgame.
+    if (isLateRound()) {
+      if (candidate.penalty == 0) {
+        score += 22.0;
+      } else {
+        score -= candidate.penalty * 10.0;
+      }
+      if (currentWinner >= 0 &&
+          currentWinner != botIndex &&
+          players[currentWinner].score >= 88 &&
+          !winning) {
+        score += 35.0;
+      }
+    }
+
+    return score.clamp(-700.0, 700.0).toDouble();
+  }
+
 CardModel chooseBotCard(
     int playerIndex,
     Player bot,
@@ -6549,11 +6700,15 @@ CardModel chooseBotCard(
   // ==========================================================
 
   bool isBetterBotTieBreak(CardModel candidate, CardModel currentBest) {
+    // Equal-scoring choices should always prefer self-preservation.
+    // Deliberate penalty transfers remain possible through the main scoring
+    // engine, but the final tie-break never prefers a more dangerous card.
     if (candidate.penalty != currentBest.penalty) {
-      if (isLateRound()) {
-        return candidate.penalty > currentBest.penalty;
-      }
       return candidate.penalty < currentBest.penalty;
+    }
+
+    if (candidate.isSpadeQueen != currentBest.isSpadeQueen) {
+      return !candidate.isSpadeQueen;
     }
 
     if (candidate.value != currentBest.value) {
@@ -7102,6 +7257,12 @@ CardModel chooseBotCard(
         winning: false,
         leading: true,
       );
+      score += scoreAttack200(
+        playerIndex,
+        candidate,
+        winning: false,
+        leading: true,
+      );
       score = balanceGrandmasterScore(score, candidate);
 
 
@@ -7278,52 +7439,14 @@ CardModel chooseBotCard(
 
     final int currentWinner = determineCurrentWinner();
 
-    // ♠Q TRANSFER:
-    // If K♠ or A♠ is already on the table and ♠Q is legally playable, the bot
-    // may choose it as a strategic penalty transfer. The authoritative
-    // legality engine remains the final gate under the current no-lock rules.
-    if (ledSuit == 'Spades' && currentWinningValue >= 13) {
-      final List<CardModel> queens =
-          sameSuit.where((card) => card.isSpadeQueen).toList();
-      if (queens.isNotEmpty && isLegalCard(playerIndex, queens.first)) {
-        return queens.first;
-      }
-    }
-
     final List<CardModel> losing = sameSuit
         .where((c) => c.value < currentWinningValue)
         .toList();
 
-    // ======================================================
-    // HARD PENALTY-TRANSFER PRIORITY
-    // ======================================================
-    // If an opponent is currently winning the led suit, and this BOT can
-    // legally follow with a penalty card that is guaranteed to lose, unload
-    // the penalty now. This is the concrete BREY transfer behavior: for
-    // example, K♦ on the table + J♦ in the BOT hand => play J♦ (4 points),
-    // rather than unnecessarily throwing a zero-point Diamond.
-    //
-    // This is still rules-first: every candidate below has already passed
-    // isLegalCard(), and a penalty that would WIN the Hand is not forced.
-    final List<CardModel> safePenaltyTransfers = losing
-        .where((c) => c.penalty > 0 && isLegalCard(playerIndex, c))
-        .toList();
-
-    if (safePenaltyTransfers.isNotEmpty) {
-      CardModel bestPenalty = safePenaltyTransfers.first;
-      double bestPenaltyScore = -double.infinity;
-      for (final CardModel candidate in safePenaltyTransfers) {
-        double penaltyScore = scorePenaltyHuntMemory(playerIndex, candidate, losing: true);
-        penaltyScore += candidate.penalty * 8.0;
-        penaltyScore += candidate.value * 0.25;
-        if (penaltyScore > bestPenaltyScore ||
-            (penaltyScore == bestPenaltyScore && isBetterBotTieBreak(candidate, bestPenalty))) {
-          bestPenaltyScore = penaltyScore;
-          bestPenalty = candidate;
-        }
-      }
-      return bestPenalty;
-    }
+    // Penalty transfers are still strategically valuable, but they are no
+    // longer an unconditional priority. Every losing legal card is evaluated
+    // by the same final decision engine so a high-penalty card such as ♠Q is
+    // not selected merely because it can be transferred.
 
     // If we can safely lose the Hand, choose the card that gives us the best
     // future position rather than simply throwing the lowest card.
@@ -7334,6 +7457,16 @@ CardModel chooseBotCard(
       for (final CardModel candidate in losing) {
         double score = strategicCardValue(playerIndex, candidate);
         score += scoreDynamicRiskReward(
+          playerIndex,
+          candidate,
+          winning: false,
+        );
+        score += scorePenaltyHuntMemory(
+          playerIndex,
+          candidate,
+          losing: true,
+        );
+        score += scoreAttack200(
           playerIndex,
           candidate,
           winning: false,
@@ -7485,6 +7618,11 @@ CardModel chooseBotCard(
         forcedWinner: true,
       );
       score += scoreDynamicRiskReward(
+        playerIndex,
+        candidate,
+        winning: true,
+      );
+      score += scoreAttack200(
         playerIndex,
         candidate,
         winning: true,
@@ -8522,8 +8660,6 @@ CardModel chooseBotCard(
     spadeQueenPlayedThisRound = false;
     globalConsecutiveLedSuit = null;
     globalConsecutiveLedSuitCount = 0;
-    for (int i = 0; i < 4; i++) {
-}
     roundPenaltyByPlayer.updateAll((key, value) => 0);
     passedCardsByPlayer.clear();
     receivedCardsByPlayer.clear();
@@ -8539,51 +8675,148 @@ CardModel chooseBotCard(
   // ==========================================================
 
   Future<void> startNextRound() async {
-    if (gameOver || dealingPhase || exchangePhase) {
+    // ----------------------------------------------------------
+    // SAFELY ENTER THE NEXT ROUND
+    // ----------------------------------------------------------
+    if (!mounted || gameOver) {
       return;
     }
 
-    if (spadeQueenCollector == null) {
-      message =
-          '♠Q collector was not found.';
+    // Prevent double-taps from starting two rounds simultaneously.
+    if (dealingPhase || exchangePhase) {
+      return;
+    }
+
+    // ----------------------------------------------------------
+    // INVALIDATE ANY OLD ASYNC BOT/DEALING WORK
+    // ----------------------------------------------------------
+    _botTurnGeneration++;
+    _botTurnScheduled = false;
+    _botRecoveryAttempts = 0;
+    _dealingGeneration++;
+
+    // ----------------------------------------------------------
+    // RECOVER THE ♠Q COLLECTOR IF THE RUNTIME VARIABLE WAS LOST
+    // ----------------------------------------------------------
+    //
+    // The player who won the Hand containing ♠Q is the dealer for
+    // the next Round. Normally spadeQueenCollector is already set.
+    // If an asynchronous transition accidentally lost it, recover it
+    // from the completed Round history instead of blocking the game.
+    int? nextDealer = spadeQueenCollector;
+
+    if (nextDealer == null &&
+        completedRoundHands.length == completedRoundWinners.length) {
+      for (int i = completedRoundHands.length - 1; i >= 0; i--) {
+        final bool queenWasInHand = completedRoundHands[i].any(
+          (played) => played.card.isSpadeQueen,
+        );
+
+        if (queenWasInHand) {
+          nextDealer = completedRoundWinners[i];
+          break;
+        }
+      }
+    }
+
+    // Absolute fallback: inspect every completed Hand snapshot.
+    if (nextDealer == null) {
+      for (int i = 0; i < completedRoundHands.length; i++) {
+        final bool queenWasInHand = completedRoundHands[i].any(
+          (played) => played.card.isSpadeQueen,
+        );
+
+        if (queenWasInHand) {
+          nextDealer = completedRoundWinners[i];
+          break;
+        }
+      }
+    }
+
+    if (nextDealer == null ||
+        nextDealer < 0 ||
+        nextDealer >= players.length) {
+      message = 'Unable to determine the next dealer.';
       if (mounted) {
         setState(() {});
       }
       return;
     }
 
+    // Preserve the recovered collector for the rest of the game.
+    spadeQueenCollector = nextDealer;
+
+    // ----------------------------------------------------------
+    // START NEXT ROUND
+    // ----------------------------------------------------------
     roundNumber++;
     _firstHandHintShown = false;
 
-    // ♠Q collector becomes dealer.
-    dealerIndex = spadeQueenCollector!;
+    // ♠Q collector becomes the dealer.
+    dealerIndex = nextDealer;
 
-    // Reset Hands won for the new Round.
-    for (Player player in players) {
+    // Reset Hands won for this Round only.
+    for (final Player player in players) {
       player.handsWon = 0;
     }
 
-    // The previous Round Summary is no longer needed once the next Round
-    // starts.
+    // ----------------------------------------------------------
+    // CLEAR PREVIOUS ROUND UI / TABLE STATE
+    // ----------------------------------------------------------
     completedRoundHands.clear();
     completedRoundWinners.clear();
     completedRoundPenalties.clear();
 
-    // Leave the Round summary immediately and let dealRound() publish
-    // the dealing screen after the dealer confirms SHUFFLE & DEAL.
-    roundFinished = false;
-    dealingPhase = false;
-    exchangePhase = false;
     currentHand.clear();
+    _playersPlayedThisHand.clear();
+
     ledSuit = null;
     handCollecting = false;
     collectingWinnerIndex = null;
     _handResolving = false;
+    _handTransitionDelay = false;
+
+    // ----------------------------------------------------------
+    // RESET ROUND FLAGS
+    // ----------------------------------------------------------
+    roundFinished = false;
+    gameOver = false;
+
+    dealingPhase = false;
+    exchangePhase = false;
+
+    dealtCardCount = 0;
+    dealingStartingPlayer = 0;
+
+    selectedExchangeCards.clear();
+    exchangeSelections.clear();
+
+    passedCardsByPlayer.clear();
+    receivedCardsByPlayer.clear();
+
+    // Fresh Round-level rule state.
+    spadeQueenPlayedThisRound = false;
+    globalConsecutiveLedSuit = null;
+    globalConsecutiveLedSuitCount = 0;
+
+    resetVoidMemory();
+    resetLeadTracking();
+    clearPrivateExchangeKnowledge();
+
+    // Reset the BOT state machine before dealing.
+    _botTurnGeneration++;
+    _botTurnScheduled = false;
+    _botRecoveryAttempts = 0;
+
+    message = 'Preparing Round $roundNumber...';
 
     if (mounted) {
       setState(() {});
     }
 
+    // ----------------------------------------------------------
+    // DEAL A COMPLETELY FRESH ROUND
+    // ----------------------------------------------------------
     await dealRound();
   }
 
