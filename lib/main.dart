@@ -1678,40 +1678,44 @@ class _BreyGameState extends State<BreyGame> {
 
   double _exchangeHighCardRisk(
     CardModel card,
-    List<CardModel> hand,
+    Map<String, List<CardModel>> handBySuit,
   ) {
-    if (card.penalty > 0 || card.value < 10) return 0.0;
+    // Only the three special fixed-penalty cards are excluded here — they
+    // have their own dedicated handling elsewhere (_exchangeCardDanger, the
+    // Spade package logic, and the Clubs/Diamonds void logic below). Hearts
+    // carry a small penalty on every card but still need this same
+    // cover-based reasoning: a high Heart with no low Hearts behind it is
+    // just as risky to hold as an uncovered high Spade.
+    final bool isSpecialPenaltyCard = card.isSpadeQueen ||
+        (card.suit == 'Clubs' && card.rank == 'K') ||
+        (card.suit == 'Diamonds' && card.rank == 'J');
+    if (isSpecialPenaltyCard || card.value < 10) return 0.0;
 
-    final int lowerSameSuit = hand.where(
-      (CardModel other) =>
-          other.suit == card.suit && other.value < card.value,
-    ).length;
+    final int lowerSameSuit = (handBySuit[card.suit] ?? const <CardModel>[])
+        .where((CardModel other) => other.value < card.value)
+        .length;
 
     if (lowerSameSuit == 0) return 360.0;
     if (lowerSameSuit == 1) return 180.0;
     if (lowerSameSuit == 2) return 70.0;
-    return 20.0;
+    // 3+ lower cards of the same suit already in hand mean this high card is
+    // well covered — it can be held and safely ducked behind for many
+    // Hands, or deployed deliberately later. Passing it away instead is
+    // actively worse than keeping it, not merely a smaller reward.
+    if (lowerSameSuit == 3) return -40.0;
+    return -90.0;
   }
 
   double _exchangeRemainingHandQuality(
-    List<CardModel> original,
-    List<CardModel> remaining,
+    Map<String, List<CardModel>> originalBySuit,
+    Map<String, List<CardModel>> remainingBySuit,
   ) {
     double score = 0.0;
-    const List<String> suits = <String>[
-      'Clubs',
-      'Diamonds',
-      'Hearts',
-      'Spades',
-    ];
 
-    for (final String suit in suits) {
-      final List<CardModel> before = original
-          .where((CardModel card) => card.suit == suit)
-          .toList();
-      final List<CardModel> after = remaining
-          .where((CardModel card) => card.suit == suit)
-          .toList();
+    for (final String suit in originalBySuit.keys) {
+      final List<CardModel> before = originalBySuit[suit]!;
+      final List<CardModel> after =
+          remainingBySuit[suit] ?? const <CardModel>[];
 
       if (before.isNotEmpty && after.isEmpty) {
         final int penalty = before.fold<int>(
@@ -1748,6 +1752,7 @@ class _BreyGameState extends State<BreyGame> {
     int botIndex,
     List<CardModel> selection,
     List<CardModel> hand,
+    Map<String, List<CardModel>> handBySuit,
   ) {
     double score = 0.0;
     final int targetIndex = exchangeTargetIndex(botIndex);
@@ -1755,10 +1760,29 @@ class _BreyGameState extends State<BreyGame> {
     final List<CardModel> remaining = List<CardModel>.from(hand)
       ..removeWhere((CardModel card) => selection.contains(card));
 
+    // Suit groupings computed once per call and reused everywhere below,
+    // instead of every suit-based section independently recomputing
+    // hand.where(...)/remaining.where(...) from scratch. handBySuit itself
+    // is computed once per BOT in chooseBotExchangeCards and passed in
+    // unchanged across all 715 candidate selections evaluated for that BOT,
+    // since the original hand never changes within one BOT's search.
+    const List<String> suits = <String>[
+      'Clubs',
+      'Diamonds',
+      'Hearts',
+      'Spades',
+    ];
+    final Map<String, List<CardModel>> remainingBySuit =
+        <String, List<CardModel>>{
+      for (final String suit in suits)
+        suit:
+            remaining.where((CardModel card) => card.suit == suit).toList(),
+    };
+
     // 1. Remove cards that are dangerous for the BOT.
     for (final CardModel card in selection) {
       score += _exchangeCardDanger(card);
-      score += _exchangeHighCardRisk(card, hand);
+      score += _exchangeHighCardRisk(card, handBySuit);
     }
 
     // 2. Passing penalty to a player who is already near the game threshold
@@ -1794,21 +1818,32 @@ class _BreyGameState extends State<BreyGame> {
     }
 
     // 3. Judge the resulting 9-card hand.
-    score += _exchangeRemainingHandQuality(hand, remaining);
+    score += _exchangeRemainingHandQuality(handBySuit, remainingBySuit);
 
     // 4. ♠Q package evaluation. Legality is already enforced by the
     // authoritative isLegalExchangeSelection() function.
     final bool passesQueen = selection.any(
       (CardModel card) => card.isSpadeQueen,
     );
-    final List<CardModel> originalSpades = hand
-        .where((CardModel card) => card.suit == 'Spades')
-        .toList();
-    final List<CardModel> remainingSpades = remaining
-        .where((CardModel card) => card.suit == 'Spades')
-        .toList();
+    final List<CardModel> originalSpades = handBySuit['Spades']!;
+    final List<CardModel> remainingSpades = remainingBySuit['Spades']!;
 
-    if (passesQueen) {
+    if (originalSpades.length > 4) {
+      // A long Spade suit (5+) already gives strong natural cover. Cards
+      // below the Queen are worth keeping — they let the BOT safely follow
+      // Spades for many Hands without ever being forced to reveal a high
+      // card. The Queen and anything above it are the actual danger in this
+      // suit and are worth passing away now, while that cover still exists
+      // to protect the remaining Spades.
+      for (final CardModel card in selection) {
+        if (card.suit != 'Spades') continue;
+        if (card.value < 12) {
+          score -= 85.0;
+        } else {
+          score += card.isSpadeQueen ? 260.0 : 140.0;
+        }
+      }
+    } else if (passesQueen) {
       final int lowerSpadesRemaining = remainingSpades
           .where((CardModel card) => card.value < 12)
           .length;
@@ -1844,19 +1879,9 @@ class _BreyGameState extends State<BreyGame> {
     // card later, rather than being forced to reveal it the moment the suit
     // runs out. Giving away the low cover cards while keeping the penalty
     // card removes that control just as much as giving away the whole suit.
-    const List<String> suits = <String>[
-      'Clubs',
-      'Diamonds',
-      'Hearts',
-      'Spades',
-    ];
     for (final String suit in suits) {
-      final List<CardModel> before = hand
-          .where((CardModel card) => card.suit == suit)
-          .toList();
-      final List<CardModel> after = remaining
-          .where((CardModel card) => card.suit == suit)
-          .toList();
+      final List<CardModel> before = handBySuit[suit]!;
+      final List<CardModel> after = remainingBySuit[suit]!;
 
       final bool suitHasPenaltyCard =
           before.any((CardModel card) => card.penalty > 0);
@@ -1886,6 +1911,77 @@ class _BreyGameState extends State<BreyGame> {
       }
     }
 
+    // 5B. Clubs/Diamonds specific void-vs-keep rule. This uses a stricter
+    // "small card" threshold (values 2-5) than the general <=7 cover used
+    // above, applied specifically to the two suits carrying a single named
+    // penalty card (K-Clubs, J-Diamonds): with little or no cover in that
+    // exact range, void the suit entirely, penalty card included; with
+    // decent cover, keeping the penalty card in that suit is fine.
+    for (final String suit in <String>['Clubs', 'Diamonds']) {
+      final List<CardModel> suitBefore = handBySuit[suit]!;
+      if (suitBefore.isEmpty) continue;
+
+      final int trueSmallCount = suitBefore
+          .where((CardModel card) => card.value >= 2 && card.value <= 5)
+          .length;
+      final bool hasPenaltyCard =
+          suitBefore.any((CardModel card) => card.penalty > 0);
+      final List<CardModel> suitAfter = remainingBySuit[suit]!;
+      final bool voidedThisSuit = suitAfter.isEmpty;
+      final bool keptPenaltyCard =
+          suitAfter.any((CardModel card) => card.penalty > 0);
+
+      if (trueSmallCount < 2) {
+        // Not much small-card cover (2,3,4,5) in this suit: prefer to void
+        // it entirely, including its penalty card if it has one.
+        if (voidedThisSuit) {
+          score += hasPenaltyCard ? 300.0 : 160.0;
+        } else if (hasPenaltyCard && keptPenaltyCard) {
+          score -= 140.0;
+        }
+      } else if (hasPenaltyCard && keptPenaltyCard) {
+        // Decent small-card cover exists: keeping the suit's penalty card
+        // is fine, since it can be hidden behind the small cards later.
+        score += 60.0;
+      }
+    }
+
+    // 5C. Hand-1 leader safety. If this BOT will lead Hand 1 (already known
+    // at exchange time, since dealRound() sets currentPlayerIndex before the
+    // exchange happens), it must still be able to open with a legal,
+    // non-penalty Clubs/Diamonds card. Passing away its last such card would
+    // force a much worse Hand-1 opening.
+    if (botIndex == currentPlayerIndex) {
+      final bool originalHasSafeLead =
+          handBySuit['Clubs']!.any((CardModel card) => card.penalty == 0) ||
+              handBySuit['Diamonds']!
+                  .any((CardModel card) => card.penalty == 0);
+      final bool remainingHasSafeLead =
+          remainingBySuit['Clubs']!
+              .any((CardModel card) => card.penalty == 0) ||
+              remainingBySuit['Diamonds']!
+                  .any((CardModel card) => card.penalty == 0);
+
+      if (originalHasSafeLead && !remainingHasSafeLead) {
+        score -= 260.0;
+      }
+    }
+
+    // 5D. Multi-void synergy. Voiding two or more suits in the same
+    // exchange is worth more than the sum of two single-suit void bonuses —
+    // it multiplies the number of future Hands where this BOT can freely
+    // dump danger cards or force an opponent, rather than being limited to
+    // one flexible suit.
+    final int suitsVoided = suits.where((String suit) {
+      final bool hadCards = handBySuit[suit]!.isNotEmpty;
+      final bool stillHasCards = remainingBySuit[suit]!.isNotEmpty;
+      return hadCards && !stillHasCards;
+    }).length;
+
+    if (suitsVoided >= 2) {
+      score += 220.0 * (suitsVoided - 1);
+    }
+
     // 6. In the late Round, immediate penalty removal matters more.
     if (isLateRound()) {
       score += selection.fold<double>(
@@ -1904,6 +2000,16 @@ class _BreyGameState extends State<BreyGame> {
     final int botIndex = players.indexOf(bot);
     List<CardModel> bestSelection = <CardModel>[];
     double bestScore = -double.infinity;
+
+    // Computed once per BOT and reused across every one of the up to 715
+    // candidate selections evaluated below, instead of every suit-based
+    // scoring section independently re-filtering the same 13-card hand from
+    // scratch on every single candidate. The original hand never changes
+    // within one BOT's search, so this only needs to happen once.
+    final Map<String, List<CardModel>> handBySuit = <String, List<CardModel>>{
+      for (final String suit in <String>['Clubs', 'Diamonds', 'Hearts', 'Spades'])
+        suit: hand.where((CardModel card) => card.suit == suit).toList(),
+    };
 
     // C(13,4) = 715 maximum combinations. Evaluate every legal package.
     for (int a = 0; a < hand.length - 3; a++) {
@@ -1926,6 +2032,7 @@ class _BreyGameState extends State<BreyGame> {
               botIndex,
               selection,
               hand,
+              handBySuit,
             );
 
             // Deterministic small tie-breaker only.
@@ -3625,6 +3732,14 @@ if (handNumber == 1) {
     return null;
   }
 
+  // Weighted by actual penalty POINTS (Q♠=12, K♣=6, J♦=4, Hearts=1), not a
+  // flat +1 per card. Previously this treated every known penalty card as
+  // equally worth hunting, which meant a suit hiding a single known Heart
+  // scored identically to one hiding the Queen of Spades. Every caller below
+  // already multiplies this by its own weight, so this single change
+  // naturally reorders hunting priority to Spades > Clubs King > Diamonds
+  // Jack > Hearts everywhere it's used, without needing separate constants
+  // per caller.
   int knownOpponentPenaltyInSuit(
     String suit,
     int exceptPlayer, {
@@ -3645,7 +3760,7 @@ if (handNumber == 1) {
           !playedCardsThisRound.any(
             (played) => cardKey(played) == entry.key,
           )) {
-        total++;
+        total += card.penalty;
       }
     }
     return total;
@@ -5054,6 +5169,42 @@ if (handNumber == 1) {
   // ==========================================================
   // DYNAMIC RISK / REWARD — VALUE THE WHOLE CURRENT HAND
   // ==========================================================
+
+  // ==========================================================
+  // UNCOVERED PENALTY CARD — SHED IT EARLY
+  // ==========================================================
+  // A penalty card with little or no low cover in its own suit (received via
+  // the exchange, or simply thin from the deal) cannot be hidden behind duck
+  // plays for long — the suit runs out quickly and the BOT is forced to
+  // expose it at a moment it does not control. Getting rid of such a card
+  // earlier, while a legal, low-risk opportunity exists, is safer than
+  // holding onto it and hoping for a better moment later.
+  double scoreUncoveredPenaltyUrgency(
+    int botIndex,
+    CardModel candidate, {
+    required bool leading,
+    required bool winning,
+  }) {
+    if (candidate.penalty <= 0 || winning) return 0.0;
+
+    final int sameSuitCount = players[botIndex].cards
+        .where((CardModel c) => c.suit == candidate.suit)
+        .length;
+    // sameSuitCount still includes the candidate itself here.
+    final int cover = sameSuitCount - 1;
+
+    if (cover > 1) return 0.0; // Already has reasonable cover; no urgency.
+
+    double score = cover == 0 ? 90.0 : 50.0;
+    if (leading) score += 30.0;
+
+    // The later in the Round this card is still sitting uncovered, the more
+    // urgent it becomes — hands are shorter, and the suit is more likely to
+    // be forced open unexpectedly.
+    if (isLateRound()) score *= 1.6;
+
+    return score;
+  }
 
   double scoreDynamicRiskReward(
     int playerIndex,
@@ -7508,6 +7659,32 @@ CardModel _chooseBotCardCore(
   // BOT LEAD — PLAN AHEAD, NOT JUST LOWEST CARD
   // ==========================================================
 
+  // If nobody else can possibly hold any card of this suit anymore (every
+  // other copy has already been played, and the only remaining copies are in
+  // this BOT's own hand), leading it is a trap rather than a safe choice:
+  // it wastes a forcing opportunity (no one is constrained to follow suit —
+  // every opponent gets a completely free discard), and it guarantees this
+  // BOT wins the trick, which hands any opponent, including the human, an
+  // open invitation to voluntarily dump their most dangerous card (the
+  // Spade Queen included) onto a trick this BOT cannot avoid taking.
+  double scoreSuitExhaustionLeadRisk(
+    CardModel candidate,
+    List<CardModel> botHand,
+  ) {
+    final int ownCountInSuit =
+        botHand.where((CardModel c) => c.suit == candidate.suit).length;
+    final int unseenInSuit = remainingUnseenSuitCards(candidate.suit).length;
+    final int possiblyHeldByOthers = unseenInSuit - ownCountInSuit;
+
+    if (possiblyHeldByOthers > 0) return 0.0;
+
+    double penalty = 160.0;
+    if (candidate.penalty > 0) {
+      penalty += candidate.penalty * 12.0;
+    }
+    return -penalty;
+  }
+
   CardModel chooseBotLeadCard(
     int playerIndex,
     Player bot,
@@ -7576,6 +7753,8 @@ CardModel _chooseBotCardCore(
         score += 38;
         if (candidate.value >= 11) score -= 25;
       }
+
+      score += scoreSuitExhaustionLeadRisk(candidate, bot.cards);
 
       // A lead that is likely to be won by an opponent with a high score can
       // deliberately move penalty risk away from the BOT.
@@ -7681,6 +7860,12 @@ CardModel _chooseBotCardCore(
         candidate,
         winning: false,
         leading: true,
+      );
+      score += scoreUncoveredPenaltyUrgency(
+        playerIndex,
+        candidate,
+        leading: true,
+        winning: false,
       );
       score = balanceGrandmasterScore(score, candidate);
 
@@ -7891,6 +8076,18 @@ CardModel _chooseBotCardCore(
         score += scoreAttack200(
           playerIndex,
           candidate,
+          winning: false,
+        );
+        score += scoreConfirmedRunoutAttack(
+          playerIndex,
+          candidate,
+          leading: false,
+          winning: false,
+        );
+        score += scoreUncoveredPenaltyUrgency(
+          playerIndex,
+          candidate,
+          leading: false,
           winning: false,
         );
         score += scoreStrategicSituation(
@@ -8324,6 +8521,12 @@ CardModel _chooseBotCardCore(
         winning: false,
       );
       score += scoreConfirmedRunoutAttack(
+        playerIndex,
+        candidate,
+        leading: false,
+        winning: false,
+      );
+      score += scoreUncoveredPenaltyUrgency(
         playerIndex,
         candidate,
         leading: false,
@@ -9483,12 +9686,18 @@ CardModel _chooseBotCardCore(
                   ),
                 ),
 
-                // Large central suit mark.
+                // Large central suit mark. On the choosing screen the cards
+                // are smaller, so the suit mark is scaled down to stay
+                // proportionate; in-game cards keep their original size.
                 Center(
                   child: Text(
                     card.symbol,
                     style: TextStyle(
-                      fontSize: selected ? 43 : 40,
+                      fontSize: exchangeMode
+                          ? (compactPhone
+                              ? (selected ? 26 : 24)
+                              : (selected ? 31 : 29))
+                          : (selected ? 43 : 40),
                       height: 1,
                       color: suitColor,
                       fontWeight: FontWeight.w500,
@@ -10895,6 +11104,46 @@ CardModel _chooseBotCardCore(
   // ROUND RESULT PANEL
   // ==========================================================
 
+  Widget _handSummaryMiniCard(PlayedCard played, bool isWinner) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          players[played.playerIndex].name,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontSize: 8.5,
+            fontWeight: FontWeight.w800,
+            color: isWinner
+                ? const Color(0xffb58b2a)
+                : const Color(0xff8a8a8a),
+          ),
+        ),
+        const SizedBox(height: 3),
+        Stack(
+          clipBehavior: Clip.none,
+          alignment: Alignment.center,
+          children: [
+            _ruleCard(
+              played.card.rank,
+              played.card.symbol,
+              highlighted: isWinner,
+            ),
+            if (isWinner)
+              Positioned(
+                top: -8,
+                child: Icon(
+                  Icons.emoji_events_rounded,
+                  size: 15,
+                  color: Colors.amber.shade700,
+                ),
+              ),
+          ],
+        ),
+      ],
+    );
+  }
+
   Widget _buildRoundHandSummary() {
     if (completedRoundHands.isEmpty) {
       return const SizedBox.shrink();
@@ -10931,27 +11180,76 @@ CardModel _chooseBotCardCore(
               ),
             ],
           ),
-          const SizedBox(height: 7),
+          const SizedBox(height: 8),
           ...List<Widget>.generate(completedRoundHands.length, (index) {
             final List<PlayedCard> plays = completedRoundHands[index];
             final int winnerIndex = completedRoundWinners[index];
             final int penalty = completedRoundPenalties[index];
-            final String cards = plays
-                .map((played) =>
-                    '${players[played.playerIndex].name} ${played.card.rank}${played.card.symbol}')
-                .join('  •  ');
             final String winnerName = players[winnerIndex].name;
 
-            return Padding(
-              padding: const EdgeInsets.symmetric(vertical: 3),
-              child: _coloredSuitText(
-                'H${index + 1}  •  $cards  •  $winnerName won  •  ${penalty == 0 ? '0' : '+$penalty'} pts',
-                textAlign: TextAlign.left,
-                style: const TextStyle(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.black87,
+            return Container(
+              margin: const EdgeInsets.symmetric(vertical: 4),
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: penalty > 0
+                      ? const Color(0xffe3b98a)
+                      : const Color(0xffd7d2c8),
                 ),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Text(
+                        'HAND ${index + 1}',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w900,
+                          color: Color(0xff174c3b),
+                        ),
+                      ),
+                      const Spacer(),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: penalty > 0
+                              ? const Color(0xfffbe6d2)
+                              : const Color(0xffe7f3ea),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Text(
+                          penalty == 0
+                              ? '$winnerName won  •  0 pts'
+                              : '$winnerName won  •  +$penalty pts',
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w800,
+                            color: penalty > 0
+                                ? const Color(0xff8a4b1f)
+                                : const Color(0xff245b32),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: plays
+                        .map((played) => _handSummaryMiniCard(
+                              played,
+                              played.playerIndex == winnerIndex,
+                            ))
+                        .toList(),
+                  ),
+                ],
               ),
             );
           }),
@@ -11234,35 +11532,75 @@ CardModel _chooseBotCardCore(
   }
 
   Widget _ruleCard(String rank, String suit, {bool highlighted = false}) {
+    final Color suitColor = _ruleSuitColor(suit);
     return Container(
       width: 48,
       height: 64,
       margin: const EdgeInsets.symmetric(horizontal: 3),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(8),
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xffffffff), Color(0xfff5f2eb)],
+        ),
+        borderRadius: BorderRadius.circular(9),
         border: Border.all(
           color: highlighted
               ? const Color(0xffb58b2a)
               : const Color(0xffd7d2c8),
           width: highlighted ? 2 : 1,
         ),
-        boxShadow: const [
+        boxShadow: [
           BoxShadow(
-            color: Color(0x18000000),
-            blurRadius: 3,
-            offset: Offset(0, 1),
+            color: highlighted
+                ? const Color(0x55d4af63)
+                : const Color(0x18000000),
+            blurRadius: highlighted ? 8 : 3,
+            spreadRadius: highlighted ? 1 : 0,
+            offset: const Offset(0, 1),
           ),
         ],
       ),
-      alignment: Alignment.center,
-      child: Text(
-        '$rank$suit',
-        style: TextStyle(
-          fontSize: 17,
-          fontWeight: FontWeight.w900,
-          color: _ruleSuitColor(suit),
-        ),
+      child: Stack(
+        children: [
+          Positioned(
+            left: 5,
+            top: 4,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  rank,
+                  style: TextStyle(
+                    fontSize: 12,
+                    height: 1,
+                    fontWeight: FontWeight.w900,
+                    color: suitColor,
+                  ),
+                ),
+                Text(
+                  suit,
+                  style: TextStyle(
+                    fontSize: 10,
+                    height: 1.1,
+                    color: suitColor,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Align(
+            alignment: const Alignment(0.15, 0.45),
+            child: Text(
+              suit,
+              style: TextStyle(
+                fontSize: 23,
+                height: 1,
+                color: suitColor,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -11270,13 +11608,20 @@ CardModel _chooseBotCardCore(
   Widget _ruleBadge(String text, {bool good = true}) {
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 3),
-      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
         color: good ? const Color(0xffeaf7ee) : const Color(0xffffeeee),
-        borderRadius: BorderRadius.circular(9),
+        borderRadius: BorderRadius.circular(20),
         border: Border.all(
           color: good ? const Color(0xff9ac9a5) : const Color(0xffe1aaaa),
         ),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x12000000),
+            blurRadius: 3,
+            offset: Offset(0, 1),
+          ),
+        ],
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
@@ -11300,6 +11645,22 @@ CardModel _chooseBotCardCore(
     );
   }
 
+  Color _ruleAccentFor(String number) {
+    const List<Color> palette = <Color>[
+      Color(0xff1d6049), // green
+      Color(0xffb58b2a), // gold
+      Color(0xff2b5f9e), // blue
+      Color(0xff8a3f8f), // purple
+      Color(0xffc0602b), // burnt orange
+      Color(0xffa93232), // red
+      Color(0xff17807e), // teal
+      Color(0xff5d6d2f), // olive
+      Color(0xff6d4c1f), // brown
+    ];
+    final int n = int.tryParse(number) ?? 1;
+    return palette[(n - 1) % palette.length];
+  }
+
   Widget _ruleVisualSection({
     required String number,
     required String title,
@@ -11307,85 +11668,245 @@ CardModel _chooseBotCardCore(
     required List<Widget> visual,
     IconData icon = Icons.menu_book_rounded,
   }) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.fromLTRB(12, 11, 12, 12),
-      decoration: BoxDecoration(
-        color: const Color(0xfffffdf8),
-        borderRadius: BorderRadius.circular(15),
-        border: Border.all(color: const Color(0xffded7c8)),
-        boxShadow: const [
-          BoxShadow(
-            color: Color(0x10000000),
-            blurRadius: 5,
-            offset: Offset(0, 2),
+    final Color accent = _ruleAccentFor(number);
+
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0.0, end: 1.0),
+      duration: const Duration(milliseconds: 380),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Transform.translate(
+            offset: Offset(0, 14 * (1 - value)),
+            child: child,
           ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
+        );
+      },
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        decoration: BoxDecoration(
+          color: const Color(0xfffffdf8),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: const Color(0xffded7c8)),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x14000000),
+              blurRadius: 7,
+              offset: Offset(0, 3),
+            ),
+          ],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(15),
+          child: Stack(
             children: [
-              Container(
-                width: 29,
-                height: 29,
-                alignment: Alignment.center,
-                decoration: const BoxDecoration(
-                  color: Color(0xffb58b2a),
-                  shape: BoxShape.circle,
-                ),
-                child: Text(
-                  number,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
+              Positioned(
+                left: 0,
+                top: 0,
+                bottom: 0,
+                width: 5,
+                child: ColoredBox(color: accent),
               ),
-              const SizedBox(width: 8),
-              Icon(icon, size: 19, color: const Color(0xff165b43)),
-              const SizedBox(width: 6),
-              Expanded(
-                child: _coloredSuitText(
-                  title,
-                  style: const TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w900,
-                    color: Color(0xff174c3b),
-                  ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(17, 11, 12, 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          width: 30,
+                          height: 30,
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            gradient: LinearGradient(
+                              begin: Alignment.topLeft,
+                              end: Alignment.bottomRight,
+                              colors: [
+                                accent.withValues(alpha: 0.80),
+                                accent,
+                              ],
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: accent.withValues(alpha: 0.35),
+                                blurRadius: 5,
+                                offset: const Offset(0, 2),
+                              ),
+                            ],
+                          ),
+                          child: Text(
+                            number,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 13.5,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 9),
+                        Container(
+                          padding: const EdgeInsets.all(5),
+                          decoration: BoxDecoration(
+                            color: accent.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(9),
+                          ),
+                          child: Icon(icon, size: 18, color: accent),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: _coloredSuitText(
+                            title,
+                            style: const TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w900,
+                              color: Color(0xff174c3b),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.visibility_rounded,
+                          size: 12,
+                          color: accent.withValues(alpha: 0.85),
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          'VISUAL EXAMPLE',
+                          style: TextStyle(
+                            fontSize: 9.5,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 0.9,
+                            color: accent.withValues(alpha: 0.85),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 5),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(
+                        vertical: 10,
+                        horizontal: 5,
+                      ),
+                      decoration: BoxDecoration(
+                        gradient: const LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [Color(0xfff8f3e7), Color(0xffede6d3)],
+                        ),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: accent.withValues(alpha: 0.25),
+                        ),
+                      ),
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          return SingleChildScrollView(
+                            scrollDirection: Axis.horizontal,
+                            child: ConstrainedBox(
+                              constraints: BoxConstraints(
+                                minWidth: constraints.maxWidth,
+                              ),
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: visual,
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.only(top: 1),
+                          child: Icon(
+                            Icons.info_outline_rounded,
+                            size: 15,
+                            color: accent,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: _coloredSuitText(
+                            explanation,
+                            textAlign: TextAlign.left,
+                            style: const TextStyle(
+                              fontSize: 12.5,
+                              height: 1.4,
+                              color: Colors.black87,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 10),
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(vertical: 9, horizontal: 5),
-            decoration: BoxDecoration(
-              color: const Color(0xfff5f0e4),
-              borderRadius: BorderRadius.circular(11),
-            ),
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: visual,
-              ),
-            ),
+        ),
+      ),
+    );
+  }
+
+  Widget _ruleFactChip(IconData icon, String text) {
+    return Container(
+      margin: const EdgeInsets.only(right: 7),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: const Color(0xfffffdf8),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: const Color(0xffd9c69a)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x10000000),
+            blurRadius: 3,
+            offset: Offset(0, 1),
           ),
-          const SizedBox(height: 9),
-          _coloredSuitText(
-            explanation,
-            textAlign: TextAlign.left,
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 14, color: const Color(0xff8a6a2b)),
+          const SizedBox(width: 5),
+          Text(
+            text,
             style: const TextStyle(
-              fontSize: 12.5,
-              height: 1.35,
-              color: Colors.black87,
+              fontSize: 10.5,
+              fontWeight: FontWeight.w900,
+              color: Color(0xff174c3b),
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _ruleQuickFacts() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: [
+            _ruleFactChip(Icons.groups_rounded, '4 PLAYERS'),
+            _ruleFactChip(Icons.style_rounded, '52 CARDS'),
+            _ruleFactChip(Icons.layers_rounded, '13 HANDS'),
+            _ruleFactChip(Icons.trending_down_rounded, 'LOWEST SCORE WINS'),
+            _ruleFactChip(Icons.flag_rounded, '100+ ENDS GAME'),
+          ],
+        ),
       ),
     );
   }
@@ -11442,13 +11963,30 @@ CardModel _chooseBotCardCore(
                                 ),
                               ),
                               SizedBox(height: 2),
-                              Text(
-                                'Quick • Clear • Visual',
-                                style: TextStyle(
-                                  color: Colors.white70,
-                                  fontSize: 11.5,
-                                  fontWeight: FontWeight.w600,
-                                ),
+                              Row(
+                                children: [
+                                  Flexible(
+                                    child: Text(
+                                      'Quick • Clear • Visual',
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        color: Colors.white70,
+                                        fontSize: 11.5,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ),
+                                  SizedBox(width: 8),
+                                  Text(
+                                    '♠ ♥ ♦ ♣',
+                                    style: TextStyle(
+                                      color: Color(0xccffe7a3),
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w700,
+                                      letterSpacing: 1.5,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ],
                           ),
@@ -11466,6 +12004,7 @@ CardModel _chooseBotCardCore(
                     child: ListView(
                       padding: const EdgeInsets.only(top: 2, bottom: 3),
                       children: [
+                        _ruleQuickFacts(),
                         _ruleVisualSection(
                           number: '1',
                           title: 'Quick Objective',
@@ -11502,9 +12041,10 @@ CardModel _chooseBotCardCore(
                             _ruleCard('7', '♣', highlighted: true),
                             _ruleCard('4', '♦', highlighted: true),
                             _ruleBadge('SAFE LEAD'),
+                            _ruleBadge('♠ BLOCKED', good: false),
                             _ruleBadge('♠Q', good: false),
                           ],
-                          explanation: 'The leader must lead a non-penalty ♣ or ♦ when available. If none is available, any card except ♠Q may lead. If you cannot follow suit, play a non-penalty card when possible; otherwise play any legal card except ♠Q.',
+                          explanation: 'The leader must lead a non-penalty ♣ or ♦ when available. Spades cannot be led or played in Hand 1 at all — not even a safe low Spade — unless Spades are your only remaining suit. If you cannot follow suit, play a non-penalty, non-Spade card when possible; otherwise play any legal card except ♠Q.',
                         ),
                         _ruleVisualSection(
                           number: '4',
